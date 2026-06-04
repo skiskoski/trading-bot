@@ -51,6 +51,21 @@ class Candle(Base):
     )
 
 
+class IndexChange(Base):
+    """A single S&P 500 add/remove event.
+
+    Used to reconstruct point-in-time membership.
+    """
+
+    __tablename__ = "index_changes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dt: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    added: Mapped[str | None] = mapped_column(String(16))
+    removed: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(255))
+
+
 engine = create_engine(settings.db_url, future=True)
 
 

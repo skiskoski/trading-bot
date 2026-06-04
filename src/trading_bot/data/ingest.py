@@ -9,50 +9,54 @@ from trading_bot.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def ingest_symbols(symbols: list[str], start: str, end: str | None = None) -> int:
-    """Download and persist OHLCV for a list of symbols.
+def ingest_symbols(
+    symbols: list[str], start: str, end: str | None = None, chunk_size: int = 50
+) -> int:
+    """Download and persist OHLCV for a list of symbols, in chunks to avoid rate limits.
 
     Skips dates already in the database (incremental ingest).
     Returns the number of new candles inserted.
     """
-    df = download_ohlcv(symbols, start=start, end=end)
-    if df.empty:
-        return 0
+    total_inserted = 0
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i : i + chunk_size]
+        df = download_ohlcv(chunk, start=start, end=end)
+        if df.empty:
+            continue
 
-    inserted = 0
-    with get_session() as session:
-        # Build a set of (symbol, dt) tuples already in db for the symbols at hand
-        existing = set(
-            session.query(Candle.symbol, Candle.dt)
-            .filter(Candle.symbol.in_(symbols))
-            .all()
-        )
-
-        rows_to_insert = []
-        for r in df.itertuples(index=False):
-            key = (r.symbol, r.dt)
-            if key in existing:
-                continue
-            rows_to_insert.append(
-                Candle(
-                    symbol=r.symbol,
-                    dt=r.dt,
-                    open=float(r.open),
-                    high=float(r.high),
-                    low=float(r.low),
-                    close=float(r.close),
-                    adj_close=float(r.adj_close),
-                    volume=float(r.volume),
-                )
+        with get_session() as session:
+            existing = set(
+                session.query(Candle.symbol, Candle.dt)
+                .filter(Candle.symbol.in_(chunk))
+                .all()
             )
 
-        if rows_to_insert:
-            session.bulk_save_objects(rows_to_insert)
-            session.commit()
-            inserted = len(rows_to_insert)
+            rows_to_insert = []
+            for r in df.itertuples(index=False):
+                key = (r.symbol, r.dt)
+                if key in existing:
+                    continue
+                rows_to_insert.append(
+                    Candle(
+                        symbol=r.symbol,
+                        dt=r.dt,
+                        open=float(r.open),
+                        high=float(r.high),
+                        low=float(r.low),
+                        close=float(r.close),
+                        adj_close=float(r.adj_close),
+                        volume=float(r.volume),
+                    )
+                )
 
-    logger.info(f"Inserted {inserted} new candles")
-    return inserted
+            if rows_to_insert:
+                session.bulk_save_objects(rows_to_insert)
+                session.commit()
+                total_inserted += len(rows_to_insert)
+        logger.info(f"Chunk {i // chunk_size + 1}: inserted {len(rows_to_insert)} new candles")
+
+    logger.info(f"Inserted {total_inserted} new candles total")
+    return total_inserted
 
 
 def incremental_update(symbols: list[str], default_start: str) -> int:

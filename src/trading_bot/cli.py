@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -52,6 +53,160 @@ def ingest_cmd(
     console.print(f"Ingesting {len(symbols)} symbols from {start}")
     inserted = ingest_symbols(symbols, start=start, end=end)
     console.print(f"[green]✓[/green] {inserted} new candles inserted")
+
+
+@app.command("ingest-all")
+def ingest_all_cmd(
+    start: str = typer.Option(settings.start_date, help="Start date YYYY-MM-DD"),
+    end: str | None = typer.Option(None, help="End date YYYY-MM-DD (default: today)"),
+    add_regime: bool = typer.Option(True, help="Also ingest SPY"),
+) -> None:
+    """Bootstrap ingest: download OHLCV for every ticker in the universe table.
+
+    Run this once after ``fetch-universe`` to populate prices for all
+    constituents. Subsequent ``ingest`` calls can then use liquidity ranking.
+    """
+    from trading_bot.data.ingest import ingest_symbols
+    from trading_bot.data.storage import Ticker, get_session, init_db
+
+    init_db()
+    with get_session() as session:
+        symbols = [s[0] for s in session.query(Ticker.symbol).order_by(Ticker.symbol).all()]
+    if add_regime and "SPY" not in symbols:
+        symbols = ["SPY", *symbols]
+    console.print(f"Ingesting ALL {len(symbols)} symbols from {start}")
+    inserted = ingest_symbols(symbols, start=start, end=end)
+    console.print(f"[green]✓[/green] {inserted} new candles inserted")
+
+
+@app.command("fetch-changes")
+def fetch_changes_cmd() -> None:
+    """Scrape the S&P 500 'Selected changes' table for point-in-time membership."""
+    from trading_bot.data.pit_universe import fetch_index_changes, persist_index_changes
+    from trading_bot.data.storage import init_db
+
+    init_db()
+    df = fetch_index_changes()
+    n = persist_index_changes(df)
+    console.print(f"[green]✓[/green] Stored {n} S&P 500 index change rows")
+
+
+@app.command("ingest-historic")
+def ingest_historic_cmd(
+    start: str = typer.Option(settings.start_date, help="Start date YYYY-MM-DD"),
+    end: str | None = typer.Option(None, help="End date YYYY-MM-DD (default: today)"),
+) -> None:
+    """Download OHLCV for symbols that were *ever* in the S&P 500 but no longer are.
+
+    Eliminates the worst form of survivorship bias by ensuring removed tickers
+    are present in the price panel.
+    """
+    from trading_bot.data.ingest import ingest_symbols
+    from trading_bot.data.pit_universe import ever_in_index
+    from trading_bot.data.storage import Ticker, get_session, init_db
+
+    init_db()
+    with get_session() as session:
+        current = {s[0] for s in session.query(Ticker.symbol).all()}
+    all_ever = ever_in_index(current)
+    only_historic = sorted(all_ever - current)
+    console.print(
+        f"Found {len(all_ever)} ever-in-index symbols, {len(only_historic)} not in current universe"
+    )
+    if not only_historic:
+        return
+    inserted = ingest_symbols(only_historic, start=start, end=end)
+    console.print(f"[green]✓[/green] {inserted} historic candles inserted")
+
+
+@app.command("validate")
+def validate_cmd(
+    strategy: str = typer.Argument("momentum"),
+    start: str = typer.Option("2018-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(100),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit", help="Use point-in-time membership"),
+    n_folds: int = typer.Option(6, help="Walk-forward folds"),
+    n_trials: int = typer.Option(1, help="Number of trials for DSR (1 = no multiple testing)"),
+) -> None:
+    """Run the full honest-validation pipeline: PIT-filtered backtest + walk-forward + DSR."""
+    from trading_bot.backtest.engine import BacktestConfig, CrossSectionalBacktester
+    from trading_bot.data.ingest import load_panel
+    from trading_bot.data.pit_universe import build_membership_panel
+    from trading_bot.data.storage import Ticker, get_session
+    from trading_bot.data.universe import get_top_n_by_liquidity
+    from trading_bot.strategies.momentum import MomentumConfig, MomentumStrategy
+    from trading_bot.validation.deflated_sharpe import (
+        deflated_sharpe_ratio,
+        probabilistic_sharpe_ratio,
+    )
+    from trading_bot.validation.walk_forward import WalkForwardConfig, run_walk_forward
+
+    if strategy != "momentum":
+        console.print(f"[red]Unknown strategy: {strategy}[/red]")
+        raise typer.Exit(code=1)
+
+    symbols = get_top_n_by_liquidity(top)
+    if "SPY" not in symbols:
+        symbols = ["SPY", *symbols]
+    panel = load_panel(symbols, start=start, end=end).dropna(how="all", axis=1)
+    if panel.empty:
+        console.print("[red]No data. Run fetch-universe + ingest-all first.[/red]")
+        raise typer.Exit(code=1)
+
+    membership = None
+    if use_pit:
+        with get_session() as session:
+            current = {s[0] for s in session.query(Ticker.symbol).all()}
+        membership = build_membership_panel(panel.index, current, symbols=list(panel.columns))
+        console.print(
+            f"PIT membership panel: {membership.shape[0]} dates × "
+            f"{membership.shape[1]} symbols ({membership.sum(axis=1).iloc[-1]} live today)"
+        )
+
+    strat = MomentumStrategy(MomentumConfig())
+    bt_cfg = BacktestConfig(membership=membership)
+    bt = CrossSectionalBacktester(strat, bt_cfg)
+    result = bt.run(panel)
+    _print_metrics(result.metrics)
+
+    psr = probabilistic_sharpe_ratio(result.returns, benchmark_sharpe=0.0)
+    dsr = deflated_sharpe_ratio(result.returns, n_trials=n_trials)
+    console.print(f"\n[bold]PSR (vs SR=0)[/bold]: {psr:.4f}")
+    console.print(f"[bold]DSR  (N={n_trials})[/bold]: {dsr:.4f}")
+
+    # Walk-forward
+    wf = run_walk_forward(
+        strat, panel, bt_cfg, WalkForwardConfig(n_folds=n_folds, test_years=1.0)
+    )
+    _print_walk_forward(wf)
+
+
+def _print_walk_forward(wf) -> None:
+    table = Table(title=f"Walk-forward folds (n={len(wf.folds)})", show_header=True)
+    table.add_column("Fold")
+    table.add_column("Test window")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("MaxDD", justify="right")
+    table.add_column("IC", justify="right")
+    table.add_column("N", justify="right")
+    for f in wf.folds:
+        table.add_row(
+            str(f.fold_id),
+            f"{f.test_start.date()} → {f.test_end.date()}",
+            f"{f.sharpe:.3f}",
+            f"{f.max_dd * 100:.2f}%",
+            f"{f.ic_mean:.4f}" if not np.isnan(f.ic_mean) else "n/a",
+            str(f.n_periods),
+        )
+    console.print(table)
+    s = wf.summary
+    console.print(
+        f"\n[bold]Summary[/bold]: "
+        f"Sharpe mean={s['sharpe_mean']:.3f} (std {s['sharpe_std']:.3f}, "
+        f"min {s['sharpe_min']:.3f}, max {s['sharpe_max']:.3f}); "
+        f"IC mean={s['ic_mean']:.4f}; profitable folds={s['fraction_profitable'] * 100:.0f}%"
+    )
 
 
 @app.command("backtest")

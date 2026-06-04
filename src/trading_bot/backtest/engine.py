@@ -16,6 +16,10 @@ class BacktestConfig:
     rebalance_freq: str = "ME"  # pandas month-end
     cost_bps: float = 5.0  # one-way transaction cost in bps
     risk_free_rate: float = 0.04
+    # Optional point-in-time membership panel: DataFrame[date, symbol] -> bool
+    # If provided, at each rebalance the strategy is restricted to symbols whose
+    # most recent membership value at-or-before that date is True.
+    membership: pd.DataFrame | None = None
 
 
 @dataclass
@@ -65,9 +69,11 @@ class CrossSectionalBacktester:
         rank_history: dict[pd.Timestamp, pd.Series] = {}
 
         for dt in rebalance_dates:
+            # Apply PIT membership mask if provided
+            prices_t = self._apply_pit_mask(prices, dt)
             try:
-                w = self.strategy.weights(prices, dt)
-                r = self.strategy.rank(prices, dt)
+                w = self.strategy.weights(prices_t, dt)
+                r = self.strategy.rank(prices_t, dt)
             except Exception as e:
                 logger.warning(f"strategy failed at {dt}: {e}")
                 continue
@@ -123,6 +129,22 @@ class CrossSectionalBacktester:
             metrics=metrics,
             ic=ic,
         )
+
+    def _apply_pit_mask(self, prices: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
+        if self.config.membership is None:
+            return prices
+        membership = self.config.membership
+        valid_dates = membership.index[membership.index <= asof]
+        if len(valid_dates) == 0:
+            return prices
+        last_row = membership.loc[valid_dates[-1]]
+        live_symbols = last_row[last_row.astype(bool)].index
+        # Keep the regime symbol even if not in membership (it's an external filter)
+        regime_sym = getattr(getattr(self.strategy, "cfg", None), "regime_symbol", None)
+        cols = list(live_symbols)
+        if regime_sym and regime_sym in prices.columns and regime_sym not in cols:
+            cols.append(regime_sym)
+        return prices[[c for c in cols if c in prices.columns]]
 
     @staticmethod
     def _forward_returns_at(rebalance_dates: pd.Index, prices: pd.DataFrame) -> pd.DataFrame:
