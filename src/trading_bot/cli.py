@@ -119,6 +119,111 @@ def ingest_historic_cmd(
     console.print(f"[green]✓[/green] {inserted} historic candles inserted")
 
 
+@app.command("strategies")
+def strategies_cmd() -> None:
+    """List all strategies in the catalog."""
+    from trading_bot.strategies.catalog import CATALOG
+
+    table = Table(title="Strategy catalog", show_header=True)
+    table.add_column("Name", style="cyan")
+    table.add_column("Signals", justify="left")
+    table.add_column("Top N", justify="right")
+    table.add_column("Rationale (truncated)")
+    for name, cfg in CATALOG.items():
+        sigs = ", ".join(
+            f"{s.feature}{'(neg)' if s.negate else ''}×{s.weight}" for s in cfg.signals
+        )
+        table.add_row(name, sigs, str(cfg.top_n), cfg.rationale[:90] + "...")
+    console.print(table)
+
+
+@app.command("run")
+def run_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2018-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(100),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+) -> None:
+    """Run a single catalog strategy and persist the run."""
+    from trading_bot.backtest.engine import BacktestConfig, CrossSectionalBacktester
+    from trading_bot.data.ingest import load_panel
+    from trading_bot.data.pit_universe import build_membership_panel
+    from trading_bot.data.storage import Ticker, get_session
+    from trading_bot.data.universe import get_top_n_by_liquidity
+    from trading_bot.registry import persist_run
+    from trading_bot.strategies.catalog import CATALOG, get_strategy
+
+    if name not in CATALOG:
+        console.print(f"[red]Unknown strategy: {name}[/red]")
+        raise typer.Exit(code=1)
+    cfg = CATALOG[name]
+
+    symbols = get_top_n_by_liquidity(top)
+    if "SPY" not in symbols:
+        symbols = ["SPY", *symbols]
+    panel = load_panel(symbols, start=start, end=end).dropna(how="all", axis=1)
+    if panel.empty:
+        console.print("[red]No data — run fetch-universe + ingest-all first[/red]")
+        raise typer.Exit(code=1)
+
+    membership = None
+    if use_pit:
+        with get_session() as session:
+            current = {s[0] for s in session.query(Ticker.symbol).all()}
+        membership = build_membership_panel(
+            panel.index, current, symbols=list(panel.columns)
+        )
+
+    strat = get_strategy(name)
+    bt = CrossSectionalBacktester(strat, BacktestConfig(membership=membership))
+    result = bt.run(panel)
+    _print_metrics(result.metrics)
+
+    run_id = persist_run(
+        cfg, result, start=start, end=end, universe_size=top, use_pit=use_pit
+    )
+    console.print(f"[green]✓[/green] Persisted run #{run_id} for '{name}'")
+
+
+@app.command("run-all")
+def run_all_cmd(
+    start: str = typer.Option("2018-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(100),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+) -> None:
+    """Run every strategy in the catalog and persist each run."""
+    from trading_bot.strategies.catalog import CATALOG
+
+    for name in CATALOG:
+        console.print(f"\n[bold cyan]━━━ {name} ━━━[/bold cyan]")
+        run_cmd(name=name, start=start, end=end, top=top, use_pit=use_pit)
+
+
+@app.command("gui")
+def gui_cmd(
+    port: int = typer.Option(8501, help="Streamlit port"),
+) -> None:
+    """Launch the Streamlit GUI."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    app_path = Path(__file__).resolve().parent / "gui" / "app.py"
+    cmd = [
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "true",
+    ]
+    console.print(f"Launching GUI at http://localhost:{port}")
+    subprocess.run(cmd, check=False)
+
+
 @app.command("validate")
 def validate_cmd(
     strategy: str = typer.Argument("momentum"),

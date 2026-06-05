@@ -66,6 +66,49 @@ class IndexChange(Base):
     reason: Mapped[str | None] = mapped_column(String(255))
 
 
+class Strategy(Base):
+    __tablename__ = "strategies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    rationale: Mapped[str] = mapped_column(String(2048), nullable=False)
+    config_json: Mapped[str] = mapped_column(String(8192), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="untested")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class Run(Base):
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    strategy_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    universe_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    use_pit: Mapped[int] = mapped_column(Integer, default=1)
+    metrics_json: Mapped[str] = mapped_column(String(4096), nullable=False)
+    equity_json: Mapped[str] = mapped_column(String(2_000_000), nullable=False)
+    returns_json: Mapped[str] = mapped_column(String(2_000_000), nullable=False)
+    psr: Mapped[float] = mapped_column(Float, default=0.0)
+    dsr: Mapped[float] = mapped_column(Float, default=0.0)
+    n_trials_used: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TrialCounter(Base):
+    """Single-row table that counts every backtest ever run, including failures.
+
+    Used by the Deflated Sharpe Ratio to honestly correct for multiple testing.
+    """
+
+    __tablename__ = "trial_counter"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    total_trials: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 engine = create_engine(settings.db_url, future=True)
 
 

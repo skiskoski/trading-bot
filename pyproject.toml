@@ -22,6 +22,8 @@ dependencies = [
     "lxml>=5.2",
     "beautifulsoup4>=4.12",
     "matplotlib>=3.8",
+    "streamlit>=1.35",
+    "plotly>=5.20",
 ]
 
 [project.optional-dependencies]
