@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gui",
+      "runtimeExecutable": "tradebot",
+      "runtimeArgs": ["gui", "--port", "8502"],
+      "port": 8502
+    }
+  ]
+}

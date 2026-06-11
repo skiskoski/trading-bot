@@ -40,8 +40,10 @@ def test_daemon_pid_alive_process(isolated_state):
 
 def test_daemon_pid_cleans_stale_pidfile(isolated_state):
     # Spawn-and-reap a child so its PID is guaranteed dead.
-    pid = os.spawnlp(os.P_NOWAIT, "true", "true")
-    os.waitpid(pid, 0)
+    import subprocess
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    pid = proc.pid
     daemon.PID_FILE.write_text(json.dumps({
         "pid": pid, "started": datetime.now(timezone.utc).isoformat(),
     }))
