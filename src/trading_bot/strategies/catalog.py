@@ -14,6 +14,7 @@ from trading_bot.strategies.composer import (
     RegimeSpec,
     SignalSpec,
 )
+from trading_bot.strategies.tsmom import TSMOMConfig, TSMOMStrategy
 
 CATALOG: dict[str, ComposedConfig] = {
     "momentum_12_1": ComposedConfig(
@@ -60,7 +61,7 @@ CATALOG: dict[str, ComposedConfig] = {
             "regime; defensive ballast for the portfolio."
         ),
         signals=(
-            SignalSpec(feature="low_volatility", params={"lookback": 252}, use_rank=True),
+            SignalSpec(feature="volatility", params={"lookback": 252}, use_rank=True, negate=True),
         ),
         filters=(
             FilterSpec(feature="above_sma", params={"window": 200}, threshold=0.5),
@@ -86,7 +87,7 @@ CATALOG: dict[str, ComposedConfig] = {
                 weight=0.6,
             ),
             SignalSpec(
-                feature="low_volatility",
+                feature="volatility",
                 params={"lookback": 252},
                 use_rank=True,
                 weight=0.4,
@@ -101,11 +102,35 @@ CATALOG: dict[str, ComposedConfig] = {
 }
 
 
-def get_strategy(name: str) -> ComposedStrategy:
+# TSMOM config stored as a separate object (not ComposedConfig) but keyed in
+# the same CATALOG dict for CLI / GUI discoverability. The rationale field is
+# pulled from TSMOMConfig.name; a pseudo-ComposedConfig wrapper gives the
+# registry the fields it expects (name, rationale).
+_TSMOM_RATIONALE = (
+    "Time-series momentum on gold (GLD/IAU). "
+    "Moskowitz-Ooi-Pedersen (2012) JFE: past 12-month return predicts future "
+    "return for a single asset. Signal = price > 200d SMA AND 12-mo return > 0; "
+    "sizing = vol-target 10% annualised (Hurst-Ooi-Pedersen 2017 AQR). "
+    "Crisis alpha sleeve: corr -0.1 to +0.2 with equity (Baur-Lucey 2010)."
+)
+
+TSMOM_CONFIG = ComposedConfig(
+    name="tsmom_gold",
+    rationale=_TSMOM_RATIONALE,
+    signals=(),   # not used — TSMOMStrategy overrides weights() directly
+    top_n=1,
+)
+
+CATALOG["tsmom_gold"] = TSMOM_CONFIG
+
+
+def get_strategy(name: str) -> ComposedStrategy | TSMOMStrategy:
     if name not in CATALOG:
         raise KeyError(
             f"Unknown strategy '{name}'. Available: {sorted(CATALOG.keys())}"
         )
+    if name == "tsmom_gold":
+        return TSMOMStrategy(TSMOMConfig())
     return ComposedStrategy(CATALOG[name])
 
 

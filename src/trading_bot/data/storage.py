@@ -29,6 +29,7 @@ class Ticker(Base):
     name: Mapped[str | None] = mapped_column(String(255))
     sector: Mapped[str | None] = mapped_column(String(64))
     sub_industry: Mapped[str | None] = mapped_column(String(128))
+    index_name: Mapped[str | None] = mapped_column(String(16))  # sp500 | sp400 | sp600
     added_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -52,9 +53,9 @@ class Candle(Base):
 
 
 class IndexChange(Base):
-    """A single S&P 500 add/remove event.
+    """A single index add/remove event (S&P 500 / 400 / 600).
 
-    Used to reconstruct point-in-time membership.
+    Used to reconstruct point-in-time membership and avoid survivorship bias.
     """
 
     __tablename__ = "index_changes"
@@ -64,6 +65,7 @@ class IndexChange(Base):
     added: Mapped[str | None] = mapped_column(String(16))
     removed: Mapped[str | None] = mapped_column(String(16))
     reason: Mapped[str | None] = mapped_column(String(255))
+    index_name: Mapped[str | None] = mapped_column(String(16))  # sp500 | sp400 | sp600
 
 
 class Strategy(Base):
@@ -93,6 +95,47 @@ class Run(Base):
     psr: Mapped[float] = mapped_column(Float, default=0.0)
     dsr: Mapped[float] = mapped_column(Float, default=0.0)
     n_trials_used: Mapped[int] = mapped_column(Integer, default=1)
+    cpcv_json: Mapped[str | None] = mapped_column(String(65536), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class FeatureScore(Base):
+    """Bayesian scorecard for each feature/param combo.
+
+    Updated after every research run. The score drives hypothesis generation:
+    features that appear in high-OOS / low-PBO strategies get a higher prior.
+    """
+
+    __tablename__ = "feature_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feature_key: Mapped[str] = mapped_column(String(256), unique=True, nullable=False, index=True)
+    times_used: Mapped[int] = mapped_column(Integer, default=0)
+    times_promoted: Mapped[int] = mapped_column(Integer, default=0)
+    sum_oos_sharpe: Mapped[float] = mapped_column(Float, default=0.0)
+    sum_pbo: Mapped[float] = mapped_column(Float, default=0.0)
+    score: Mapped[float] = mapped_column(Float, default=0.5)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ResearchLog(Base):
+    """One row per hypothesis tested by the autonomous research loop."""
+
+    __tablename__ = "research_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    round_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    hypothesis_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    config_json: Mapped[str] = mapped_column(String(8192), nullable=False)
+    rationale: Mapped[str] = mapped_column(String(2048), nullable=False)
+    ic_prescan: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oos_sharpe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pbo: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dsr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    skip_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    arm_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    universe_size: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

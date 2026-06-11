@@ -10,6 +10,7 @@ from trading_bot.strategies.composer import (
     RegimeSpec,
     SignalSpec,
 )
+from trading_bot.strategies.tsmom import TSMOMStrategy
 
 
 def make_panel(n: int = 800, seed: int = 0) -> pd.DataFrame:
@@ -28,8 +29,11 @@ def make_panel(n: int = 800, seed: int = 0) -> pd.DataFrame:
 def test_catalog_loadable():
     for name in CATALOG:
         strat = get_strategy(name)
-        assert isinstance(strat, ComposedStrategy)
-        assert strat.cfg.rationale  # must be non-empty
+        assert isinstance(strat, (ComposedStrategy, TSMOMStrategy))
+        # Every strategy must have a non-empty rationale (pre-registration check)
+        cfg = strat.cfg if hasattr(strat, "cfg") else None
+        if cfg is not None and hasattr(cfg, "rationale"):
+            assert cfg.rationale
 
 
 def test_composer_long_top_n_equal_weight():

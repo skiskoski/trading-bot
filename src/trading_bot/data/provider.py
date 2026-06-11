@@ -31,12 +31,22 @@ def download_ohlcv(symbols: list[str], start: str, end: str | None = None) -> pd
         logger.warning("yfinance returned empty data")
         return pd.DataFrame()
 
+    def _normalise_col(c) -> str:
+        """Handle both string and (ticker, field) MultiIndex column names."""
+        if isinstance(c, tuple):
+            c = c[-1]   # take the field part, e.g. ("GLD", "Adj Close") → "Adj Close"
+        return str(c).lower().replace(" ", "_")
+
     frames: list[pd.DataFrame] = []
     if len(symbols) == 1:
         df = raw.copy()
-        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+        if isinstance(df.columns, pd.MultiIndex):
+            # yfinance ≥ 0.2.x returns MultiIndex even for a single ticker
+            df.columns = [_normalise_col(c) for c in df.columns]
+        else:
+            df.columns = [_normalise_col(c) for c in df.columns]
         df["symbol"] = symbols[0]
-        df = df.reset_index().rename(columns={"Date": "dt", "index": "dt"})
+        df = df.reset_index().rename(columns={"Date": "dt", "index": "dt", "date": "dt"})
         frames.append(df)
     else:
         for sym in symbols:
@@ -45,9 +55,9 @@ def download_ohlcv(symbols: list[str], start: str, end: str | None = None) -> pd
             sub = raw[sym].copy()
             if sub.dropna(how="all").empty:
                 continue
-            sub.columns = [c.lower().replace(" ", "_") for c in sub.columns]
+            sub.columns = [_normalise_col(c) for c in sub.columns]
             sub["symbol"] = sym
-            sub = sub.reset_index().rename(columns={"Date": "dt", "index": "dt"})
+            sub = sub.reset_index().rename(columns={"Date": "dt", "index": "dt", "date": "dt"})
             frames.append(sub)
 
     if not frames:
