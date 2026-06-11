@@ -40,8 +40,10 @@ def probabilistic_sharpe_ratio(
     # SR* in per-period units
     sr_star_per_period = benchmark_sharpe / math.sqrt(periods_per_year)
 
+    # Bailey & López de Prado: Var(SR) ∝ 1 − γ3·SR + (γ4−1)/4·SR² con γ4
+    # curtosi GREZZA (normale = 3). pandas dà l'eccesso → (γ4−1) = g4 + 2.
     denom = math.sqrt(
-        max(1e-12, 1.0 - g3 * sr_per_period + ((g4) / 4.0) * sr_per_period * sr_per_period)
+        max(1e-12, 1.0 - g3 * sr_per_period + ((g4 + 2.0) / 4.0) * sr_per_period * sr_per_period)
     )
     numer = (sr_per_period - sr_star_per_period) * math.sqrt(n - 1)
     z = numer / denom

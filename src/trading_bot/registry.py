@@ -23,6 +23,7 @@ from sqlalchemy import select
 from trading_bot.backtest.engine import BacktestResult
 from trading_bot.data.storage import Run, Strategy, TrialCounter, get_session, init_db
 from trading_bot.strategies.composer import ComposedConfig
+from trading_bot.validation.cpcv import CPCVResult
 from trading_bot.utils.logging import get_logger
 from trading_bot.validation.deflated_sharpe import (
     deflated_sharpe_ratio,
@@ -41,6 +42,8 @@ def _config_to_json(config: ComposedConfig) -> str:
         "name": config.name,
         "rationale": config.rationale,
         "top_n": config.top_n,
+        "gold_weight": getattr(config, "gold_weight", 0.0),
+        "gold_mode": getattr(config, "gold_mode", "defensive"),
         "signals": [
             {
                 "feature": s.feature,
@@ -110,6 +113,33 @@ def trial_count() -> int:
         return int(row.total_trials) if row else 0
 
 
+def estimate_sigma_sr(min_runs: int = 10, default: float = 0.5) -> float:
+    """σ_SR empirico: deviazione standard cross-sezionale degli Sharpe
+    annualizzati di tutti i run persistiti.
+
+    Bailey & López de Prado definiscono il benchmark deflazionato come
+    E[max] · σ_SR dove σ_SR è la dispersione REALE dei trial — non una
+    costante. Con σ fisso a 0.5 e N nell'ordine delle centinaia il
+    benchmark esplode (Sharpe ≈ 1.5+) e il DSR collassa a 0 per qualsiasi
+    strategia: era il bug "DSR sempre 0". Clippato in [0.1, 1.0] contro
+    campioni degeneri.
+    """
+    with get_session() as session:
+        rows = session.execute(select(Run.metrics_json)).scalars().all()
+    sharpes: list[float] = []
+    for mj in rows:
+        try:
+            s = json.loads(mj).get("Sharpe")
+            if s is not None and s == s:
+                sharpes.append(float(s))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+    if len(sharpes) < min_runs:
+        return default
+    sd = float(np.std(sharpes, ddof=1))
+    return float(min(max(sd, 0.1), 1.0))
+
+
 def persist_run(
     config: ComposedConfig,
     result: BacktestResult,
@@ -117,13 +147,16 @@ def persist_run(
     end: str | None,
     universe_size: int,
     use_pit: bool,
-    sigma_sr_annualised: float = 0.5,
+    sigma_sr_annualised: float | None = None,
+    cpcv_result: CPCVResult | None = None,
 ) -> int:
     strategy_id = register_strategy(config)
     n = increment_trial_count(1)
+    sigma_sr = (sigma_sr_annualised if sigma_sr_annualised is not None
+                else estimate_sigma_sr())
     psr = probabilistic_sharpe_ratio(result.returns, benchmark_sharpe=0.0)
     dsr = deflated_sharpe_ratio(
-        result.returns, n_trials=n, sigma_sr_annualised=sigma_sr_annualised
+        result.returns, n_trials=n, sigma_sr_annualised=sigma_sr
     )
 
     end_date = (
@@ -148,7 +181,24 @@ def persist_run(
             "values": [float(v) for v in rt.values],
         }
     )
-    status = "promoted" if (dsr >= 0.95 and result.metrics.get("Sharpe", 0) > 0.5) else "tested"
+    # Promotion gate: DSR ≥ 0.95 AND (if CPCV available) PBO < 0.5
+    pbo_ok = (cpcv_result is None) or (cpcv_result.pbo < 0.5)
+    status = "promoted" if (dsr >= 0.95 and result.metrics.get("Sharpe", 0) > 0.5 and pbo_ok) else "tested"
+
+    cpcv_json_str: str | None = None
+    if cpcv_result is not None:
+        cpcv_json_str = json.dumps({
+            "k": cpcv_result.k,
+            "n_test": cpcv_result.n_test,
+            "n_paths": cpcv_result.n_paths,
+            "pbo": cpcv_result.pbo,
+            "mean_oos_sharpe": cpcv_result.mean_oos_sharpe,
+            "std_oos_sharpe": cpcv_result.std_oos_sharpe,
+            "median_oos_sharpe": cpcv_result.median_oos_sharpe,
+            "fraction_positive": cpcv_result.fraction_positive,
+            "oos_sharpe_distribution": cpcv_result.oos_sharpe_distribution,
+            "is_sharpe_distribution": cpcv_result.is_sharpe_distribution,
+        })
 
     with get_session() as session:
         run = Run(
@@ -164,6 +214,7 @@ def persist_run(
             psr=float(psr) if psr == psr else 0.0,
             dsr=float(dsr) if dsr == dsr else 0.0,
             n_trials_used=n,
+            cpcv_json=cpcv_json_str,
         )
         session.add(run)
         # Update strategy status
@@ -175,7 +226,7 @@ def persist_run(
 
     logger.info(
         f"Persisted run for {config.name}: Sharpe={result.metrics.get('Sharpe', 0):.3f}, "
-        f"PSR={psr:.3f}, DSR={dsr:.3f}, status={status}, N_trials={n}"
+        f"PSR={psr:.3f}, DSR={dsr:.3f} (σ_SR={sigma_sr:.3f}), status={status}, N_trials={n}"
     )
     return run_id
 
@@ -201,6 +252,7 @@ def list_runs() -> list[dict]:
                 "psr": r.psr,
                 "dsr": r.dsr,
                 "n_trials_used": r.n_trials_used,
+                "cpcv": json.loads(r.cpcv_json) if r.cpcv_json else None,
                 "created_at": r.created_at,
             }
             for r in rows
@@ -223,6 +275,7 @@ def get_run(run_id: int) -> dict:
             "psr": r.psr,
             "dsr": r.dsr,
             "n_trials_used": r.n_trials_used,
+            "cpcv": json.loads(r.cpcv_json) if r.cpcv_json else None,
         }
 
 
