@@ -775,16 +775,26 @@ def gui_cmd(
     keep_existing: bool = typer.Option(
         False, "--keep-existing",
         help="NON terminare un eventuale server GUI già attivo sulla porta"),
+    stop: bool = typer.Option(
+        False, "--stop", help="Ferma la GUI in ascolto sulla porta ed esci"),
 ) -> None:
-    """Launch the Streamlit GUI.
+    """Avvia la GUI Streamlit in background (non blocca il terminale).
 
-    Di default termina qualsiasi server GUI già in ascolto sulla porta prima
-    di ripartire: la GUI è headless e sopravvive alla chiusura del terminale,
-    quindi senza questo le modifiche al codice non si vedrebbero mai.
+    Gira staccata: il prompt torna subito libero, così puoi lanciare anche
+    `tradebot research-daemon` nello stesso terminale. Sopravvive alla
+    chiusura della shell. Riavviando, termina prima il server vecchio sulla
+    porta (le modifiche al codice si vedono sempre). Ferma con: gui --stop.
     """
     import os
     import subprocess
+    import time
+    import urllib.request
     from pathlib import Path
+
+    if stop:
+        _kill_stale_gui(port)
+        console.print(f"[green]✓[/green] GUI fermata (porta {port}).")
+        return
 
     if not keep_existing:
         _kill_stale_gui(port)
@@ -809,8 +819,46 @@ def gui_cmd(
         "NO_PROXY": "*",
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
     }
-    console.print(f"Launching GUI at http://localhost:{port}")
-    subprocess.run(cmd, check=False, env=env)
+
+    # Lancio DETACHED, non bloccante: prima `subprocess.run` teneva occupato il
+    # terminale finché non facevi Ctrl+C, quindi qualunque comando digitato dopo
+    # (es. `tradebot research-daemon`) non partiva mai. Ora la GUI gira in
+    # background con output su log e il prompt torna subito libero.
+    log_dir = Path.home() / ".trading_bot"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "gui.log"
+    log_f = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+        start_new_session=True, env=env,
+    )
+
+    # Aspetta che il server risponda (o che muoia in avvio) per dare un esito.
+    url = f"http://localhost:{port}"
+    deadline = time.monotonic() + 20.0
+    up = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            console.print(f"[red]La GUI è morta in avvio (exit {proc.returncode}). "
+                          f"Controlla: {log_path}[/red]")
+            raise typer.Exit(code=1)
+        try:
+            with urllib.request.urlopen(f"{url}/_stcore/health", timeout=1) as r:
+                if r.status == 200:
+                    up = True
+                    break
+        except Exception:
+            time.sleep(0.4)
+
+    if up:
+        console.print(f"[green]✓[/green] GUI attiva su [bold]{url}[/bold] "
+                      f"(pid {proc.pid}) — il terminale è libero.")
+        console.print(f"  Log:   {log_path}")
+        console.print(f"  Stop:  tradebot gui --stop")
+    else:
+        console.print(f"[yellow]GUI avviata (pid {proc.pid}) ma non ha ancora "
+                      f"risposto. Apri {url} tra qualche secondo. Log: {log_path}"
+                      f"[/yellow]")
 
 
 @app.command("validate")
