@@ -34,28 +34,60 @@ def inject_css() -> None:
     st.markdown(f"""
     <style>
     /* ── chrome ──────────────────────────────────────────── */
-    /* Nascondi SOLO menu, footer e toolbar — MAI l'header intero: dentro
-       c'è il chevron che apre/chiude la sidebar (bug Safari: visibility
-       sull'header lo eliminava). */
+    /* CAUSA VERA del "non vedo la freccia su Safari": il pulsante di apertura
+       sidebar (stExpandSidebarButton) è figlio di stToolbar. Prima nascondevo
+       TUTTA la toolbar con visibility:hidden e ri-mostravo solo il bottone con
+       visibility:visible. Chromium onora quell'override annidato (per questo nel
+       preview funzionava), ma Safari NO → il bottone restava invisibile.
+       Soluzione: NON nascondere la toolbar. Nascondo solo i bottoni Deploy/menu,
+       lasciando che il pulsante sidebar erediti normalmente visibility:visible. */
     #MainMenu {{ visibility: hidden; }}
     footer {{ visibility: hidden; }}
-    [data-testid="stToolbar"] {{ visibility: hidden; }}
+    [data-testid="stToolbarActions"] {{ display: none !important; }}
+    [data-testid="stStatusWidget"] {{ display: none !important; }}
+    [data-testid="stAppDeployButton"] {{ display: none !important; }}
     header[data-testid="stHeader"] {{
         background: transparent;
         box-shadow: none;
     }}
-    /* Chevron sidebar SEMPRE visibile (Streamlit lo mostra solo in hover:
-       era il motivo per cui "la freccia non c'è") e leggibile sul nero. */
+    /* Forziamo comunque i chevron visibili (Streamlit li mostra solo in hover
+       di default) e leggibili sul nero — ora senza dover combattere un
+       antenato hidden. */
     [data-testid="stSidebarCollapseButton"],
     [data-testid="stExpandSidebarButton"],
     [data-testid="stSidebarCollapsedControl"] {{
         visibility: visible !important;
+        opacity: 1 !important;
     }}
-    [data-testid="stSidebarCollapseButton"] *,
-    [data-testid="stExpandSidebarButton"] *,
-    [data-testid="stSidebarCollapsedControl"] * {{
+    /* Disegniamo la freccia con un carattere di sistema («/») invece di affidarci
+       al glifo Material Symbols (che su Safari, caricato in async, può non
+       renderizzarsi). Sfondo + bordo così il bersaglio si vede comunque. */
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="stSidebarCollapseButton"] {{
+        background: {CARD2} !important;
+        border: 1px solid {BORDER} !important;
+        border-radius: 8px !important;
+    }}
+    [data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"],
+    [data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"] {{
+        font-size: 0 !important;          /* nascondi la ligature del font */
+        line-height: 1 !important;
+    }}
+    [data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"]::after {{
+        content: "»";
+        font-family: {FONT} !important;   /* font di sistema: sempre presente */
+        font-size: 20px !important;
+        font-weight: 700;
         color: {TEXT} !important;
-        fill: {TEXT} !important;
+        visibility: visible !important;
+    }}
+    [data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"]::after {{
+        content: "«";
+        font-family: {FONT} !important;
+        font-size: 20px !important;
+        font-weight: 700;
+        color: {TEXT} !important;
+        visibility: visible !important;
     }}
     .block-container {{padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px;}}
 

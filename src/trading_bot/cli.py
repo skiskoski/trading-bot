@@ -402,12 +402,14 @@ def research_daemon_cmd(
     pbo_gate: float = typer.Option(0.4, help="PBO massimo per la promozione"),
     min_oos_sharpe: float = typer.Option(0.5, help="OOS Sharpe attivo minimo"),
     n_signals: int | None = typer.Option(None, help="Forza n. segnali: 1/2/3 (default: tutti)"),
+    workers: int = typer.Option(1, help="Candidati in parallelo (2 = ~1.5x più veloce su multi-core)"),
 ) -> None:
     """Avvia il research loop come daemon in background — gira finché non lo fermi.
 
     Il processo si stacca dal terminale: puoi chiudere la shell. Log su
-    ~/.trading_bot/research.log (seguilo con tail -f). Ferma con:
-    tradebot research-stop.
+    ~/.trading_bot/research.log. Segui in tempo reale con:
+      tradebot research-follow
+    Ferma con: tradebot research-stop.
     """
     from trading_bot.research.daemon import LOG_FILE, daemon_pid, start_daemon
 
@@ -423,7 +425,7 @@ def research_daemon_cmd(
             "rounds": rounds, "candidates_per_round": candidates,
             "ic_prescan_threshold": ic_threshold, "cpcv_k": cpcv_k,
             "pbo_gate": pbo_gate, "min_oos_sharpe": min_oos_sharpe,
-            "n_signals": n_signals,
+            "n_signals": n_signals, "workers": workers,
             # nel daemon i batch si riciclano: mai fermarsi alle promozioni
             "target_promotions": 10_000,
         })
@@ -431,8 +433,9 @@ def research_daemon_cmd(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1) from None
 
-    console.print(f"[green]✓[/green] Daemon avviato (pid {pid})")
-    console.print(f"  Log:    tail -f {LOG_FILE}")
+    console.print(f"[green]✓[/green] Daemon avviato (pid {pid})"
+                  + (f"  [dim]workers={workers}[/dim]" if workers > 1 else ""))
+    console.print(f"  Log:    tradebot research-follow")
     console.print("  Stato:  tradebot research-status")
     console.print("  Stop:   tradebot research-stop")
 
@@ -452,6 +455,54 @@ def research_stop_cmd(
     else:
         console.print(f"[yellow]⚠ Daemon non rispondeva — terminato forzatamente "
                       f"(pid {pid})[/yellow]")
+
+
+@app.command("research-follow")
+def research_follow_cmd(
+    lines: int = typer.Option(40, help="Righe di storico da mostrare all'avvio"),
+) -> None:
+    """Segui il log del daemon in tempo reale — come tail -f con colori (Ctrl+C per uscire)."""
+    import time as _time
+    from trading_bot.research.daemon import LOG_FILE
+
+    if not LOG_FILE.exists():
+        console.print(f"[yellow]Nessun log trovato ({LOG_FILE}).[/yellow]")
+        console.print("Avvia il daemon prima: [bold]tradebot research-daemon[/bold]")
+        return
+
+    def _colorize(line: str) -> str:
+        if "★ PROMOTED" in line or "PROMOTED" in line:
+            return f"[bold green]{line}[/bold green]"
+        if "SKIP" in line:
+            return f"[yellow]{line}[/yellow]"
+        if "ERROR" in line or "Error" in line or "Traceback" in line:
+            return f"[red]{line}[/red]"
+        if "━━━ Batch" in line:
+            return f"[bold cyan]{line}[/bold cyan]"
+        if "Testing:" in line:
+            return f"[cyan]{line}[/cyan]"
+        if "OOS Sharpe" in line:
+            return f"[bold]{line}[/bold]"
+        if "PASS" in line:
+            return f"[green]{line}[/green]"
+        if "fail" in line:
+            return f"[red]{line}[/red]"
+        return line
+
+    console.print(f"[dim]Seguendo {LOG_FILE} (Ctrl+C per uscire)[/dim]\n")
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+            for ln in all_lines[-lines:]:
+                console.print(_colorize(ln.rstrip()), markup=True)
+            while True:
+                ln = f.readline()
+                if ln:
+                    console.print(_colorize(ln.rstrip()), markup=True)
+                else:
+                    _time.sleep(0.3)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Follow terminato.[/dim]")
 
 
 @app.command("research-status")
@@ -663,14 +714,80 @@ def run_portfolio_cmd(
         console.print(table)
 
 
+def _kill_stale_gui(port: int) -> None:
+    """Termina qualsiasi server Streamlit già in ascolto sulla porta.
+
+    La GUI parte headless e SOPRAVVIVE alla chiusura del terminale: senza
+    questo, riavviare `tradebot gui` si limita a riconnettersi al vecchio
+    processo, che serve ancora il codice/CSS congelato in memoria → "le
+    modifiche non si vedono mai". Qui lo ammazziamo prima di ripartire.
+    """
+    import os
+    import signal
+    import subprocess
+    import time
+
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return  # lsof assente (raro su macOS) — pazienza, niente kill
+
+    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    my_pid = os.getpid()
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            console.print(f"[dim]Chiudo il server GUI precedente (pid {pid}) "
+                          f"sulla porta {port}…[/dim]")
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            console.print(f"[yellow]Non posso terminare il pid {pid} "
+                          f"(permessi). Chiudilo a mano.[/yellow]")
+            continue
+    if pids:
+        # Attendi il rilascio della porta (SIGTERM → SIGKILL se ostinato).
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            still = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True,
+            ).stdout.split()
+            if not still:
+                return
+            time.sleep(0.4)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.5)
+
+
 @app.command("gui")
 def gui_cmd(
     port: int = typer.Option(8501, help="Streamlit port"),
+    keep_existing: bool = typer.Option(
+        False, "--keep-existing",
+        help="NON terminare un eventuale server GUI già attivo sulla porta"),
 ) -> None:
-    """Launch the Streamlit GUI."""
+    """Launch the Streamlit GUI.
+
+    Di default termina qualsiasi server GUI già in ascolto sulla porta prima
+    di ripartire: la GUI è headless e sopravvive alla chiusura del terminale,
+    quindi senza questo le modifiche al codice non si vedrebbero mai.
+    """
     import os
     import subprocess
     from pathlib import Path
+
+    if not keep_existing:
+        _kill_stale_gui(port)
 
     app_path = Path(__file__).resolve().parent / "gui" / "app.py"
     cmd = [

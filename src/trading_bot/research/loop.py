@@ -15,7 +15,10 @@ Resume by running again — it skips already-tested configs.
 from __future__ import annotations
 
 import json
+import math as _math
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import pandas as pd
@@ -38,6 +41,14 @@ from trading_bot.validation.cpcv import CPCVConfig, run_cpcv
 
 logger = get_logger(__name__)
 console = Console()
+_console_lock = threading.Lock()
+
+
+def _cprint(*args, **kwargs) -> None:
+    """Thread-safe console.print — usato dai worker paralleli."""
+    with _console_lock:
+        console.print(*args, **kwargs)
+
 
 init_db()
 
@@ -59,6 +70,7 @@ class LoopConfig:
     target_promotions: int = 3              # stop early if reached
     use_pit: bool = True
     n_signals: int | None = None            # None=all, 1=single, 2=dual, 3=triple
+    workers: int = 1                        # candidati in parallelo (ThreadPoolExecutor)
 
 
 def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
@@ -182,12 +194,12 @@ def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
             if ucb1_done and arch_done:
                 break
 
-        round_tested = 0
+        # ── Pre-resolve candidates (sequenziale: dedup, nome, log entry) ──
+        resolved_candidates: list[dict] = []
+        round_idx = 0
         for source, candidate in candidate_queue:
-            if round_tested >= cfg.candidates_per_round:
+            if round_idx >= cfg.candidates_per_round:
                 break
-
-            # Unpack depending on source
             if source == "ucb1":
                 ucb_score, arm = candidate
                 fp = arm.fingerprint
@@ -203,10 +215,9 @@ def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
                 arch_label = "pure_factor"
                 arm_obj = arm
             else:
-                # Archetype candidate
                 arch_result = candidate
                 cfg_composed = arch_result.config
-                name = f"r{round_id:02d}_{arch_result.archetype[:6]}_{round_tested:02d}"[:60]
+                name = f"r{round_id:02d}_{arch_result.archetype[:6]}_{round_idx:02d}"[:60]
                 cfg_composed = ComposedConfig(
                     name=name,
                     rationale=cfg_composed.rationale,
@@ -220,127 +231,70 @@ def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
                 feat_names = [s.feature for s in cfg_composed.signals]
                 arm_obj = None
 
-            console.print(
-                f"\n  [cyan]Testing:[/cyan] {name}  "
-                f"[dim]{arch_label}[/dim]  UCB1={ucb_score:.3f}"
-            )
-            console.print(f"    Signals: {feat_names}")
-
-            # Log with archetype info embedded in rationale
             if arm_obj is not None:
                 log_entry = _log_arm(round_id, arm_obj, cfg_composed,
                                      universe_size=cfg.top_n_universe)
             else:
                 log_entry = _log_hypothesis_cfg(round_id, cfg_composed, arch_label,
                                                 universe_size=cfg.top_n_universe)
+            resolved_candidates.append({
+                "name": name, "cfg_composed": cfg_composed,
+                "arch_label": arch_label, "ucb_score": ucb_score,
+                "feat_names": feat_names, "log_id": log_entry["id"],
+            })
+            round_idx += 1
 
-            # ── 3. IC pre-scan ────────────────────────────────────────────
-            ic_mean = _ic_prescan_config(cfg_composed, panel_prescan, bt_cfg)
-            _update_log(log_entry["id"], ic_prescan=ic_mean)
-            console.print(f"    IC pre-scan: {ic_mean:.4f}", end="")
-
-            if ic_mean < cfg.ic_prescan_threshold:
-                console.print(f"  [yellow]→ SKIP (IC < {cfg.ic_prescan_threshold})[/yellow]")
-                _update_log(log_entry["id"], status="skipped",
-                            skip_reason=f"IC={ic_mean:.4f} < threshold")
-                for sig in cfg_composed.signals:
-                    update_score(sig.feature, sig.params, oos_sharpe=-0.1, pbo=0.8,
-                                 promoted=False, universe=cfg.top_n_universe)
-                round_tested += 1
-                continue
-
-            console.print(f"  [green]→ proceed to full backtest[/green]")
-
-            # ── 4. Full backtest + CPCV ───────────────────────────────────
+        # ── Compute (parallelo se workers > 1, altrimenti sequenziale) ──
+        _cargs = (panel, panel_prescan, bt_cfg, benchmark_returns, cfg)
+        if cfg.workers <= 1:
             try:
-                strat = ComposedStrategy(cfg_composed)
-                bt = CrossSectionalBacktester(strat, bt_cfg)
-                result = bt.run(panel)
-
-                cpcv_result = run_cpcv(
-                    strat, panel, bt_cfg,
-                    CPCVConfig(k=cfg.cpcv_k, n_test=2, purge_days=21),
-                    benchmark_returns=benchmark_returns,   # ACTIVE Sharpe (audit C2)
-                )
-
-                oos_sharpe = cpcv_result.mean_oos_sharpe
-                pbo = cpcv_result.pbo
-
-                run_id = persist_run(
-                    cfg_composed, result,
-                    start=cfg.start, end=cfg.end,
-                    universe_size=cfg.top_n_universe,
-                    use_pit=cfg.use_pit,
-                    cpcv_result=cpcv_result,
-                )
-
-                dsr = _get_run_dsr(run_id)
-                # Gate (audit C2 + M8 + Harvey-Liu-Zhu 2016): PBO non-parametric
-                # + ACTIVE OOS Sharpe floor che SALE col numero di trial
-                # (multiple-testing: con centinaia di test la soglia classica
-                # produce falsi positivi; HLZ richiedono t>3 ≈ +30-60% hurdle)
-                # + path robustness (≥65% of CPCV paths positive).
-                import math as _math
-                n_tr = trial_count()
-                eff_min_oos = cfg.min_oos_sharpe * (
-                    1.0 + 0.3 * max(0.0, _math.log10(max(n_tr, 1) / 100))
-                )
-                gate_pass = (
-                    pbo < cfg.pbo_gate
-                    and oos_sharpe >= eff_min_oos
-                    and cpcv_result.fraction_positive >= 0.65
-                )
-
-                _update_log(log_entry["id"],
-                            oos_sharpe=oos_sharpe, pbo=pbo, dsr=dsr,
-                            status="promoted" if gate_pass else "tested")
-
-                _print_result(name, oos_sharpe, pbo, dsr, gate_pass)
-                console.print(f"    [dim]soglia OOS adattiva: {eff_min_oos:.3f} (N={n_tr} trial)[/dim]")
-
-                # ── 5. Update scorecard (namespaced by universe) ──────────
-                for sig in cfg_composed.signals:
-                    update_score(sig.feature, sig.params,
-                                 oos_sharpe=oos_sharpe, pbo=pbo, promoted=gate_pass,
-                                 universe=cfg.top_n_universe)
-
-                if gate_pass:
-                    promoted.append(name)
-                    console.print(f"  [bold green]★ PROMOTED: {name}[/bold green]")
-                    if cfg_composed.gold_weight > 0:
-                        console.print(
-                            f"    [cyan]gold param:[/cyan] {cfg_composed.gold_weight:.0%} "
-                            f"({cfg_composed.gold_mode})"
-                        )
-                    # Telegram notification
-                    try:
-                        from trading_bot.live.notifier import get_notifier
-                        n = get_notifier()
-                        if n:
-                            n.notify_promotion(name, oos_sharpe, pbo, dsr)
-                    except Exception:
-                        pass
-                    if len(promoted) >= cfg.target_promotions:
-                        console.print(
-                            f"\n[green]Target of {cfg.target_promotions} promotions reached![/green]"
-                        )
+                for res in resolved_candidates:
+                    if stop_event is not None and stop_event.is_set():
+                        console.print("[yellow]Stop richiesto — uscita pulita.[/yellow]")
                         _print_summary(promoted, total_rounds)
                         return promoted
-
+                    r = _compute_candidate(res, *_cargs)
+                    if r["promoted"]:
+                        promoted.append(r["name"])
+                        if len(promoted) >= cfg.target_promotions:
+                            console.print(
+                                f"\n[green]Target {cfg.target_promotions} "
+                                f"promozioni raggiunto![/green]"
+                            )
+                            _print_summary(promoted, round_id)
+                            return promoted
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted — progress saved.[/yellow]")
                 _print_summary(promoted, total_rounds)
                 return promoted
-            except Exception as e:
-                console.print(f"  [red]Error: {e}[/red]")
-                logger.debug(traceback.format_exc())
-                _update_log(log_entry["id"], status="error", skip_reason=str(e)[:200])
-
-            round_tested += 1
-
-            if stop_event is not None and stop_event.is_set():
-                console.print("[yellow]Stop richiesto — trial corrente "
-                              "persistito, uscita pulita.[/yellow]")
+        else:
+            try:
+                with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
+                    futs = {
+                        ex.submit(_compute_candidate, res, *_cargs): res["name"]
+                        for res in resolved_candidates
+                    }
+                    for fut in as_completed(futs):
+                        r = fut.result()
+                        if r["promoted"]:
+                            promoted.append(r["name"])
+                            if len(promoted) >= cfg.target_promotions:
+                                for f in futs:
+                                    f.cancel()
+                                console.print(
+                                    f"\n[green]Target {cfg.target_promotions} "
+                                    f"promozioni raggiunto![/green]"
+                                )
+                                _print_summary(promoted, round_id)
+                                return promoted
+                        if stop_event is not None and stop_event.is_set():
+                            for f in futs:
+                                f.cancel()
+                            console.print("[yellow]Stop richiesto — uscita pulita.[/yellow]")
+                            _print_summary(promoted, total_rounds)
+                            return promoted
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted — progress saved.[/yellow]")
                 _print_summary(promoted, total_rounds)
                 return promoted
 
@@ -437,6 +391,119 @@ def _get_run_dsr(run_id: int) -> float:
         return 0.0
 
 
+def _compute_candidate(
+    resolved: dict,
+    panel: pd.DataFrame,
+    panel_prescan: pd.DataFrame,
+    bt_cfg,
+    benchmark_returns: pd.Series,
+    cfg: "LoopConfig",
+) -> dict:
+    """IC prescan + backtest + CPCV per un candidato. Thread-safe.
+
+    Usato sia nel path sequenziale (workers=1) sia nel path parallelo
+    (ThreadPoolExecutor). Ogni chiamata crea le proprie sessioni DB.
+    """
+    name = resolved["name"]
+    cfg_composed = resolved["cfg_composed"]
+    log_id = resolved["log_id"]
+    arch_label = resolved["arch_label"]
+    ucb_score = resolved["ucb_score"]
+    feat_names = resolved["feat_names"]
+
+    _cprint(
+        f"\n  [cyan]Testing:[/cyan] {name}  "
+        f"[dim]{arch_label}[/dim]  UCB1={ucb_score:.3f}"
+    )
+    _cprint(f"    Signals: {feat_names}")
+
+    ic_mean = _ic_prescan_config(cfg_composed, panel_prescan, bt_cfg)
+    _update_log(log_id, ic_prescan=ic_mean)
+
+    if ic_mean < cfg.ic_prescan_threshold:
+        _cprint(
+            f"    IC pre-scan: {ic_mean:.4f}  "
+            f"[yellow]→ SKIP (IC < {cfg.ic_prescan_threshold})[/yellow]"
+        )
+        _update_log(log_id, status="skipped",
+                    skip_reason=f"IC={ic_mean:.4f} < threshold")
+        for sig in cfg_composed.signals:
+            update_score(sig.feature, sig.params, oos_sharpe=-0.1, pbo=0.8,
+                         promoted=False, universe=cfg.top_n_universe)
+        return {"name": name, "promoted": False, "status": "skipped",
+                "ic": ic_mean, "oos_sharpe": None, "pbo": None, "dsr": None}
+
+    _cprint(f"    IC pre-scan: {ic_mean:.4f}  [green]→ backtest completo[/green]")
+
+    try:
+        strat = ComposedStrategy(cfg_composed)
+        bt_runner = CrossSectionalBacktester(strat, bt_cfg)
+        result = bt_runner.run(panel)
+
+        cpcv_result = run_cpcv(
+            strat, panel, bt_cfg,
+            CPCVConfig(k=cfg.cpcv_k, n_test=2, purge_days=21),
+            benchmark_returns=benchmark_returns,
+        )
+
+        oos_sharpe = cpcv_result.mean_oos_sharpe
+        pbo = cpcv_result.pbo
+
+        run_id = persist_run(
+            cfg_composed, result,
+            start=cfg.start, end=cfg.end,
+            universe_size=cfg.top_n_universe,
+            use_pit=cfg.use_pit,
+            cpcv_result=cpcv_result,
+        )
+
+        dsr = _get_run_dsr(run_id)
+        n_tr = trial_count()
+        eff_min_oos = cfg.min_oos_sharpe * (
+            1.0 + 0.3 * max(0.0, _math.log10(max(n_tr, 1) / 100))
+        )
+        gate_pass = (
+            pbo < cfg.pbo_gate
+            and oos_sharpe >= eff_min_oos
+            and cpcv_result.fraction_positive >= 0.65
+        )
+
+        _update_log(log_id, oos_sharpe=oos_sharpe, pbo=pbo, dsr=dsr,
+                    status="promoted" if gate_pass else "tested")
+        _print_result(name, oos_sharpe, pbo, dsr, gate_pass)
+        _cprint(f"    [dim]soglia OOS adattiva: {eff_min_oos:.3f} (N={n_tr} trial)[/dim]")
+
+        for sig in cfg_composed.signals:
+            update_score(sig.feature, sig.params, oos_sharpe=oos_sharpe, pbo=pbo,
+                         promoted=gate_pass, universe=cfg.top_n_universe)
+
+        if gate_pass:
+            _cprint(f"  [bold green]★ PROMOTED: {name}[/bold green]")
+            if cfg_composed.gold_weight > 0:
+                _cprint(
+                    f"    [cyan]gold param:[/cyan] {cfg_composed.gold_weight:.0%} "
+                    f"({cfg_composed.gold_mode})"
+                )
+            try:
+                from trading_bot.live.notifier import get_notifier
+                notif = get_notifier()
+                if notif:
+                    notif.notify_promotion(name, oos_sharpe, pbo, dsr)
+            except Exception:
+                pass
+
+        return {"name": name, "promoted": gate_pass,
+                "status": "promoted" if gate_pass else "tested",
+                "ic": ic_mean, "oos_sharpe": oos_sharpe, "pbo": pbo, "dsr": dsr}
+
+    except Exception as e:
+        _cprint(f"  [red]Error: {e}[/red]")
+        logger.debug(traceback.format_exc())
+        _update_log(log_id, status="error", skip_reason=str(e)[:200])
+        return {"name": name, "promoted": False, "status": "error",
+                "ic": ic_mean, "oos_sharpe": None, "pbo": None, "dsr": None}
+
+
 def _load_tested_fingerprints(universe: int | None = None) -> set[str]:
     """Load fingerprints of already-tested configs from research log.
 
@@ -499,7 +566,7 @@ def _load_tested_fingerprints(universe: int | None = None) -> set[str]:
 
 def _print_result(name: str, oos_sharpe: float, pbo: float, dsr: float, gate_pass: bool) -> None:
     color = "green" if gate_pass else "yellow" if pbo < 0.5 else "red"
-    console.print(
+    _cprint(
         f"  [{color}]OOS Sharpe={oos_sharpe:.3f}  PBO={pbo:.3f}  DSR={dsr:.3f}  "
         f"{'★ PASS' if gate_pass else 'fail'}[/{color}]"
     )

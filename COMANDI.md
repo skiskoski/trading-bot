@@ -67,11 +67,14 @@ all'infinito, sopravvive alla chiusura del terminale.
 # AVVIA il daemon (torna subito al prompt)
 tradebot research-daemon
 
+# AVVIA con 2 strategie in parallelo (~1.5x più veloce su multi-core)
+tradebot research-daemon --workers 2
+
+# SEGUI il log in tempo reale con colori (Ctrl+C per smettere, NON ferma il daemon)
+tradebot research-follow
+
 # STATO: pid, uptime, trial in sessione, scorecard
 tradebot research-status
-
-# SEGUI il log in tempo reale (Ctrl+C per smettere di guardare, NON lo ferma)
-tail -f ~/.trading_bot/research.log
 
 # FERMA il daemon (chiusura pulita: completa il trial in corso e persiste)
 tradebot research-stop
@@ -83,12 +86,16 @@ tradebot research-stop --timeout 180
 Opzioni utili del daemon:
 
 ```bash
-# Universo più piccolo, più candidati per round
-tradebot research-daemon --top 200 --candidates 12
+# Universo più piccolo, più candidati per round, 2 worker paralleli
+tradebot research-daemon --top 200 --candidates 12 --workers 2
 
 # Solo strategie a segnale singolo
 tradebot research-daemon --n-signals 1
 ```
+
+Perché è lento? Ogni trial che supera l'IC prescan richiede 45 backtest CPCV su 20
+anni di dati. Su un laptop, un trial dura 1-4 minuti. Non è bloccato — sta lavorando.
+Con `--workers 2` si testano due strategie in parallelo: speedup reale ~1.4-1.8x.
 
 Run di ricerca singolo (vecchio comportamento, 5 round e si ferma):
 
