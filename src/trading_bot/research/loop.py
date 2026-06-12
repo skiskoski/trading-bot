@@ -71,6 +71,11 @@ class LoopConfig:
     use_pit: bool = True
     n_signals: int | None = None            # None=all, 1=single, 2=dual, 3=triple
     workers: int = 1                        # candidati in parallelo (ThreadPoolExecutor)
+    # Costo IBKR realistico: commissione fissa per ordine su un capitale reale di
+    # riferimento. Penalizza alto turnover/troppe posizioni → il gate promuove
+    # solo strategie profittevoli NETTO costi. capital_base=None per disattivarlo.
+    capital_base: float | None = 10_000.0
+    fixed_cost_per_trade: float = 0.35
 
 
 def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
@@ -110,7 +115,11 @@ def run_research_loop(cfg: LoopConfig, stop_event=None) -> list[str]:
     membership = None
     if cfg.use_pit:
         membership = build_membership_panel(panel.index, current_tickers, symbols=list(panel.columns))
-    bt_cfg = BacktestConfig(membership=membership)
+    bt_cfg = BacktestConfig(
+        membership=membership,
+        capital_base=cfg.capital_base,
+        fixed_cost_per_trade=cfg.fixed_cost_per_trade,
+    )
 
     # Equal-weight universe daily returns — benchmark for ACTIVE Sharpe
     # (audit C2: absolute Sharpe gates pass on beta alone in bull samples).

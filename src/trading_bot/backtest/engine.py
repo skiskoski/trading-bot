@@ -14,7 +14,15 @@ logger = get_logger(__name__)
 class BacktestConfig:
     initial_capital: float = 100_000.0
     rebalance_freq: str = "ME"  # pandas month-end
-    cost_bps: float = 5.0  # one-way transaction cost in bps
+    cost_bps: float = 5.0  # one-way transaction cost in bps (slippage + spread)
+    # Commissione FISSA per ordine (es. IBKR ~$0.35/ordine). A capitali piccoli
+    # domina: su una posizione da €1.000, €0.35 = 3.5 bps; su €100 = 35 bps.
+    # Modellata solo se capital_base è impostato — altrimenti il backtest resta
+    # scale-invariant (comportamento storico invariato).
+    #   capital_base       = capitale reale deployato (valuta del conto, es. USD)
+    #   fixed_cost_per_trade = costo fisso per singolo ordine, stessa valuta
+    capital_base: float | None = None
+    fixed_cost_per_trade: float = 0.0
     # NOTE (audit M6): Sharpe is computed with rf=0 everywhere for internal
     # consistency; gates are calibrated on rf=0. No risk_free_rate knob —
     # it was dead config that suggested otherwise.
@@ -225,6 +233,26 @@ class CrossSectionalBacktester:
         )
         cost = turnovers * cost_per_bp
         portfolio_returns = portfolio_returns - cost
+
+        # ── Commissione fissa per ordine (IBKR & co.) ────────────────────────
+        # Conta gli ORDINI per rebalance (nomi il cui peso cambia) e ne addebita
+        # il costo fisso come frazione del conto. Il conto cresce nel tempo →
+        # la commissione fissa pesa sempre meno (realistico). Niente circolarità:
+        # il valore conto usa l'equity pre-costo-fisso shiftata di un giorno.
+        if self.config.capital_base and self.config.fixed_cost_per_trade > 0:
+            wdiff = weights_df.fillna(0.0).diff()
+            if len(weights_df) > 0:
+                wdiff.iloc[0] = weights_df.iloc[0].fillna(0.0)  # apertura = tutti ordini
+            n_trades = (wdiff.abs() > 1e-6).sum(axis=1)
+            n_trades_daily = (
+                n_trades.shift(1).reindex(prices.index).fillna(0.0)
+            )
+            pre_mult = (1 + portfolio_returns).cumprod().shift(1).fillna(1.0)
+            account_value = (self.config.capital_base * pre_mult).clip(lower=1.0)
+            fixed_drag = (
+                n_trades_daily * self.config.fixed_cost_per_trade
+            ) / account_value
+            portfolio_returns = portfolio_returns - fixed_drag
 
         equity = (1 + portfolio_returns).cumprod() * self.config.initial_capital
 

@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "gui",
-      "runtimeExecutable": "tradebot",
-      "runtimeArgs": ["gui", "--port", "8502"],
+      "runtimeExecutable": ".venv/bin/streamlit",
+      "runtimeArgs": ["run", "src/trading_bot/gui/app.py", "--server.port", "8502", "--server.headless", "true"],
       "port": 8502
     }
   ]

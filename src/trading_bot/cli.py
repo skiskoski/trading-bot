@@ -163,6 +163,27 @@ def ingest_all_cmd(
         f"across {len(todo)} symbols."
     )
 
+    # Cambio EUR/USD: serve per denominare in euro le curve (conto IBKR in USD).
+    from trading_bot.data.ingest import ingest_fx
+    try:
+        fx = ingest_fx(start=start)
+        console.print(f"[green]✓[/green] EUR/USD: {fx:,} nuove righe.")
+    except Exception as e:
+        console.print(f"[yellow]EUR/USD non aggiornato: {e}[/yellow]")
+
+
+@app.command("ingest-fx")
+def ingest_fx_cmd(
+    start: str = typer.Option("2005-01-01", help="Data inizio YYYY-MM-DD"),
+) -> None:
+    """Scarica il cambio EUR/USD giornaliero (per denominare le curve in euro)."""
+    from trading_bot.data.ingest import ingest_fx
+    from trading_bot.data.storage import init_db
+
+    init_db()
+    n = ingest_fx(start=start)
+    console.print(f"[green]✓[/green] EUR/USD: {n:,} righe inserite.")
+
 
 @app.command("universe-stats")
 def universe_stats_cmd() -> None:
@@ -403,6 +424,8 @@ def research_daemon_cmd(
     min_oos_sharpe: float = typer.Option(0.5, help="OOS Sharpe attivo minimo"),
     n_signals: int | None = typer.Option(None, help="Forza n. segnali: 1/2/3 (default: tutti)"),
     workers: int = typer.Option(1, help="Candidati in parallelo (2 = ~1.5x più veloce su multi-core)"),
+    capital_base: float = typer.Option(10_000.0, help="Capitale reale di riferimento per la commissione fissa IBKR"),
+    fixed_cost: float = typer.Option(0.35, help="Commissione fissa per ordine (es. IBKR ~$0.35)"),
 ) -> None:
     """Avvia il research loop come daemon in background — gira finché non lo fermi.
 
@@ -426,6 +449,7 @@ def research_daemon_cmd(
             "ic_prescan_threshold": ic_threshold, "cpcv_k": cpcv_k,
             "pbo_gate": pbo_gate, "min_oos_sharpe": min_oos_sharpe,
             "n_signals": n_signals, "workers": workers,
+            "capital_base": capital_base, "fixed_cost_per_trade": fixed_cost,
             # nel daemon i batch si riciclano: mai fermarsi alle promozioni
             "target_promotions": 10_000,
         })

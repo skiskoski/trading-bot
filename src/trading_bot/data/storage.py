@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    event,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -153,6 +154,23 @@ class TrialCounter(Base):
 
 
 engine = create_engine(settings.db_url, future=True)
+
+
+if settings.db_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_concurrency_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        """WAL + busy_timeout: letture (GUI) e scritture (daemon) convivono.
+
+        Senza WAL, SQLite blocca l'intero DB durante ogni scrittura e una
+        lettura concorrente fallisce con 'database is locked'. WAL consente
+        più lettori e uno scrittore in parallelo; busy_timeout fa attendere
+        invece di fallire subito.
+        """
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=10000")   # 10s
+        cur.execute("PRAGMA synchronous=NORMAL")   # sicuro in WAL, più veloce
+        cur.close()
 
 
 def init_db() -> None:

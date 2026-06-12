@@ -13,6 +13,10 @@ from trading_bot.data.storage import ResearchLog, get_session
 
 UNIVERSE = 500
 GATE = "PBO<0.4 · OOS attivo≥0.5 · path+≥65%"
+# Costo IBKR realistico per le curve mostrate (conto USD): commissione fissa
+# ~$0.35/ordine su un capitale reale di riferimento. Stessi default della ricerca.
+CAPITAL_BASE = 10_000.0
+FIXED_COST_PER_TRADE = 0.35
 
 
 @st.cache_data(ttl=300)
@@ -89,12 +93,46 @@ def compute_curves():
         try:
             r = CrossSectionalBacktester(
                 build_strategy(item["config"], item["name"]),
-                BacktestConfig()).run(panel)
+                BacktestConfig(capital_base=CAPITAL_BASE,
+                               fixed_cost_per_trade=FIXED_COST_PER_TRADE)).run(panel)
             rets[item["name"]] = r.returns
             data[item["name"]] = 100 * (1 + r.returns).cumprod()
         except Exception:
             continue
     return data, rets
+
+
+@st.cache_data(ttl=900)
+def load_fx_eurusd() -> pd.Series:
+    """Serie EUR/USD (USD per 1 EUR) dal 2005. Vuota se non ancora ingerita."""
+    from trading_bot.data.ingest import load_fx_eurusd as _load
+    return _load("2005-01-01")
+
+
+def to_eur_curve(eq_usd: pd.Series, fx: pd.Series) -> pd.Series:
+    """Converte una curva equity in USD → EUR (conto USD vissuto da un europeo).
+
+    Valore in EUR = valore in USD / (USD per EUR). Rinormalizzata allo stesso
+    punto di partenza così le curve USD ed EUR sono confrontabili a vista.
+    """
+    if fx.empty:
+        return eq_usd
+    fx_a = fx.reindex(eq_usd.index).ffill().bfill()
+    raw = eq_usd / fx_a
+    return raw / raw.iloc[0] * eq_usd.iloc[0]
+
+
+def to_eur_returns(ret_usd: pd.Series, fx: pd.Series) -> pd.Series:
+    """Converte i rendimenti giornalieri USD → EUR.
+
+    r_EUR = (1 + r_USD) × (fx_{t-1}/fx_t) − 1: il cambio aggiunge il proprio
+    moltiplicatore al rendimento del portafoglio USD.
+    """
+    if fx.empty:
+        return ret_usd
+    fx_a = fx.reindex(ret_usd.index).ffill().bfill()
+    fx_ret = fx_a.pct_change().fillna(0.0)
+    return (1 + ret_usd) / (1 + fx_ret) - 1
 
 
 def fmt_metrics(ret: pd.Series) -> dict:

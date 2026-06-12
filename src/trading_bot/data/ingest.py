@@ -80,6 +80,31 @@ def incremental_update(symbols: list[str], default_start: str) -> int:
     return total
 
 
+FX_EURUSD = "EURUSD=X"   # yfinance: prezzo di 1 EUR in USD (USD per EUR)
+
+
+def ingest_fx(start: str = "2005-01-01") -> int:
+    """Scarica e persiste il cambio EUR/USD giornaliero (pseudo-simbolo).
+
+    Volume 0 → il filtro di liquidità dell'universo lo esclude automaticamente,
+    quindi non finisce mai tra i titoli tradabili. Incrementale come gli altri.
+    """
+    last = last_stored_date(FX_EURUSD)
+    next_start = (last + timedelta(days=1)).isoformat() if last else start
+    if pd.Timestamp(next_start).date() > date.today():
+        logger.info("EUR/USD già aggiornato.")
+        return 0
+    return ingest_symbols([FX_EURUSD], start=next_start)
+
+
+def load_fx_eurusd(start: str = "2005-01-01", end: str | None = None) -> pd.Series:
+    """Serie giornaliera EUR/USD (USD per 1 EUR). Vuota se non ancora ingerita."""
+    panel = load_panel([FX_EURUSD], start=start, end=end)
+    if panel.empty or FX_EURUSD not in panel.columns:
+        return pd.Series(dtype=float)
+    return panel[FX_EURUSD].dropna()
+
+
 def load_panel(symbols: list[str], start: str, end: str | None = None) -> pd.DataFrame:
     """Load adjusted-close prices as a wide DataFrame (date index, symbol cols)."""
     from sqlalchemy import select

@@ -61,3 +61,43 @@ def test_metrics_consistency():
     assert result.metrics["Sharpe"] == sr
     dd = max_drawdown(result.equity)
     assert result.metrics["MaxDrawdown"] == dd
+
+
+# ── Commissione fissa per ordine (IBKR) ──────────────────────────────────────
+
+def test_fixed_cost_disabled_by_default_is_unchanged():
+    """capital_base=None (default) → backtest identico a prima del modello costi."""
+    panel = make_panel()
+    strat = MomentumStrategy(MomentumConfig(top_n=3))
+    base = CrossSectionalBacktester(strat, BacktestConfig()).run(panel)
+    # stessa identica config esplicita
+    again = CrossSectionalBacktester(
+        strat, BacktestConfig(capital_base=None, fixed_cost_per_trade=0.35)
+    ).run(panel)
+    assert base.metrics["CAGR"] == again.metrics["CAGR"]
+
+
+def test_fixed_cost_reduces_return_monotonic_in_capital():
+    """Costo fisso abbassa il CAGR; un conto più piccolo lo abbassa di più."""
+    panel = make_panel()
+    strat = MomentumStrategy(MomentumConfig(top_n=3))
+    none = CrossSectionalBacktester(strat, BacktestConfig()).run(panel)
+    big = CrossSectionalBacktester(
+        strat, BacktestConfig(capital_base=100_000, fixed_cost_per_trade=0.35)
+    ).run(panel)
+    small = CrossSectionalBacktester(
+        strat, BacktestConfig(capital_base=1_000, fixed_cost_per_trade=0.35)
+    ).run(panel)
+    assert big.metrics["CAGR"] < none.metrics["CAGR"]
+    assert small.metrics["CAGR"] < big.metrics["CAGR"]
+
+
+def test_fixed_cost_zero_fee_is_noop():
+    """fixed_cost_per_trade=0 → nessun effetto anche con capital_base impostato."""
+    panel = make_panel()
+    strat = MomentumStrategy(MomentumConfig(top_n=3))
+    base = CrossSectionalBacktester(strat, BacktestConfig()).run(panel)
+    zero = CrossSectionalBacktester(
+        strat, BacktestConfig(capital_base=10_000, fixed_cost_per_trade=0.0)
+    ).run(panel)
+    assert base.metrics["CAGR"] == zero.metrics["CAGR"]

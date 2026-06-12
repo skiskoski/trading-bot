@@ -14,7 +14,8 @@ from sqlalchemy import select
 from trading_bot.data.storage import ResearchLog, get_session
 from trading_bot.gui.data import (GATE, compute_curves, daemon_info,
                                   fmt_metrics, fmt_uptime, load_chart_panel,
-                                  load_top5)
+                                  load_fx_eurusd, load_top5, to_eur_curve,
+                                  to_eur_returns)
 from trading_bot.gui.glossary import section_help, spiega
 from trading_bot.gui.style import (BLUE, GREEN, PALETTE, RED, TEXT2, cards,
                                    pill, plotly_layout, section)
@@ -79,6 +80,20 @@ else:
                     unsafe_allow_html=True)
     data, rets = compute_curves()
 
+    # ── Valuta: USD (mercato) o EUR (quello che vivi tu) ──────────────────
+    fx = load_fx_eurusd()
+    cur = "EUR"
+    if not fx.empty:
+        cur = st.radio("Valuta", ["EUR", "USD"], horizontal=True,
+                       help="Il conto IBKR è in USD; in EUR vedi il rendimento "
+                            "reale incluso il cambio. La selezione dei titoli e "
+                            "l'edge vs benchmark non cambiano: il cambio è un "
+                            "fattore comune a tutto il portafoglio.")
+        if cur == "EUR":
+            data = {k: to_eur_curve(v, fx) for k, v in data.items()}
+            rets = {k: to_eur_returns(v, fx) for k, v in rets.items()}
+    sym = "€" if cur == "EUR" else "$"
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=data["SPY"].index, y=data["SPY"], name="SPY",
                              line=dict(color=TEXT2, width=1.2, dash="dash")))
@@ -95,9 +110,10 @@ else:
                                  line=dict(color=c, width=1.8)))
         i += 1
     fig.update_yaxes(
-        type="log", title="valore di $100 investiti",
+        type="log", title=f"valore di {sym}100 investiti",
         tickvals=[100, 200, 500, 1000, 2000, 5000, 10000, 20000],
-        ticktext=["$100", "$200", "$500", "$1k", "$2k", "$5k", "$10k", "$20k"],
+        ticktext=[f"{sym}100", f"{sym}200", f"{sym}500", f"{sym}1k",
+                  f"{sym}2k", f"{sym}5k", f"{sym}10k", f"{sym}20k"],
     )
     fig.update_xaxes(
         rangeslider=dict(visible=True, thickness=0.06),
