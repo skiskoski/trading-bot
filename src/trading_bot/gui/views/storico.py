@@ -28,7 +28,9 @@ df = pd.DataFrame([{
     "Sharpe": round(r["metrics"].get("Sharpe", float("nan")), 3)
     if r["metrics"].get("Sharpe") is not None else None,
     "CAGR": r["metrics"].get("CAGR"),
-    "MaxDD": r["metrics"].get("MaxDD"),
+    "MaxDD": (round(r["metrics"]["MaxDrawdown"], 3)
+              if isinstance(r["metrics"].get("MaxDrawdown"), (int, float))
+              else None),
     "PSR": round(r["psr"], 3) if r["psr"] is not None else None,
     "DSR": round(r["dsr"], 3) if r["dsr"] is not None else None,
     "PBO": (round(r["cpcv"]["pbo"], 3) if r.get("cpcv") else None),
@@ -81,8 +83,9 @@ if sel_id:
             ("Sharpe", f"{m.get('Sharpe', 0):.2f}", None, "blue"),
             ("CAGR", (f"{m['CAGR']:.1%}" if isinstance(m.get("CAGR"), float)
                       else str(m.get("CAGR", "—"))), None, "green"),
-            ("MaxDD", (f"{m['MaxDD']:.1%}" if isinstance(m.get("MaxDD"), float)
-                       else str(m.get("MaxDD", "—"))), None, "red"),
+            ("MaxDD", (f"{m['MaxDrawdown']:.1%}"
+                       if isinstance(m.get("MaxDrawdown"), float)
+                       else str(m.get("MaxDrawdown", "—"))), None, "red"),
             ("DSR", f"{r['dsr']:.3f}", f"trial #{r['n_trials_used']}", "gold"),
         ])
         eq = r["equity"]
