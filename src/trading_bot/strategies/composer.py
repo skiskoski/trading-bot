@@ -132,30 +132,47 @@ class ComposedStrategy(BaseStrategy):
 
         return score.dropna()
 
-    def _gold_active(self, prices: pd.DataFrame, asof: pd.Timestamp) -> bool:
-        """Should the gold sleeve be ON at ``asof``? Uses only data ≤ asof.
+    # Drawdown ramp per lo sleeve oro difensivo: nessun oro finché il
+    # drawdown di SPY (dal picco trailing) è < _GOLD_DD_LO, peso pieno a
+    # _GOLD_DD_HI. Scala lineare in mezzo. La vol di mercato funge da
+    # booster (max con la rampa drawdown).
+    _GOLD_DD_LO = 0.05
+    _GOLD_DD_HI = 0.20
+    _GOLD_VOL_LO = 0.25
+    _GOLD_VOL_HI = 0.40
 
-        defensive mode: ONLY when equity max-drawdown risk is elevated —
-        SPY below SMA200 OR market 21d vol > 25% annualized.
-        always mode: whenever gold's own trend allows.
-        Both modes require GLD above its own SMA200.
+    def _gold_scale(self, prices: pd.DataFrame, asof: pd.Timestamp) -> float:
+        """Quota dello sleeve oro da attivare a ``asof``, in [0, 1]. Solo dati ≤ asof.
+
+        Il peso oro EFFETTIVO è ``gold_weight × _gold_scale``: invece di un
+        on/off, l'oro entra in modo graduale man mano che il drawdown di SPY
+        si approfondisce (crisis ballast proporzionale alla crisi).
+          defensive: scala con max(profondità drawdown, stress di volatilità).
+          always:    1.0 finché il trend dell'oro lo consente.
+        Entrambe richiedono GLD sopra la sua SMA200 (no falling-knife).
         """
         if "GLD" not in prices.columns:
-            return False
+            return 0.0
         gld = prices["GLD"].loc[:asof].dropna()
         if len(gld) < 200 or gld.iloc[-1] <= gld.iloc[-200:].mean():
-            return False    # gold itself in downtrend — no knife catching
+            return 0.0    # gold itself in downtrend — no knife catching
         if self.cfg.gold_mode == "always":
-            return True
-        # defensive: equity stress expected?
+            return 1.0
+        # defensive: scala con la severità dello stress azionario
         if "SPY" not in prices.columns:
-            return False
+            return 0.0
         spy = prices["SPY"].loc[:asof].dropna()
         if len(spy) < 200:
-            return False
-        below_sma = spy.iloc[-1] < spy.iloc[-200:].mean()
+            return 0.0
+        # Drawdown dal picco trailing (1 anno), PIT
+        window = spy.iloc[-252:] if len(spy) >= 252 else spy
+        peak = float(window.max())
+        dd = max(0.0, (peak - float(spy.iloc[-1])) / peak) if peak > 0 else 0.0
+        dd_scale = (dd - self._GOLD_DD_LO) / (self._GOLD_DD_HI - self._GOLD_DD_LO)
+        # Booster di volatilità
         vol21 = float(spy.pct_change().iloc[-21:].std() * np.sqrt(252))
-        return bool(below_sma or vol21 > 0.25)
+        vol_scale = (vol21 - self._GOLD_VOL_LO) / (self._GOLD_VOL_HI - self._GOLD_VOL_LO)
+        return float(np.clip(max(dd_scale, vol_scale), 0.0, 1.0))
 
     def weights(self, prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
         # Regime gate (equity sleeve only — gold sleeve decided separately:
@@ -180,10 +197,13 @@ class ComposedStrategy(BaseStrategy):
                 if not top.empty:
                     out = pd.Series(1.0 / len(top), index=top.index)
 
-        # Gold sleeve: a strategy parameter, not a fixed overlay
+        # Gold sleeve: peso proporzionale alla severità della crisi (non on/off).
+        # Peso effettivo = gold_weight × scala-drawdown.
         gw = self.cfg.gold_weight
-        if gw > 0 and self._gold_active(prices, asof):
-            out = out * (1.0 - gw)
-            out.loc["GLD"] = out.get("GLD", 0.0) + gw
+        if gw > 0:
+            eff_gw = gw * self._gold_scale(prices, asof)
+            if eff_gw > 1e-4:
+                out = out * (1.0 - eff_gw)
+                out.loc["GLD"] = out.get("GLD", 0.0) + eff_gw
 
         return out

@@ -144,3 +144,59 @@ class TestPaperMods:
         assert thr(50) == 0.5 and thr(100) == 0.5
         assert thr(1000) > thr(100)
         assert abs(thr(1000) - 0.65) < 1e-9
+
+
+# ── Gold sleeve proporzionale alla profondità del drawdown ───────────────────
+
+def _gold_panel(spy_path, gld_rising=True):
+    import numpy as np
+    import pandas as pd
+    n = len(spy_path)
+    idx = pd.date_range("2018-01-01", periods=n, freq="B")
+    gld = np.linspace(100, 160, n) if gld_rising else np.linspace(160, 100, n)
+    data = {"SPY": spy_path, "GLD": gld}
+    for s in ("A", "B", "C"):
+        data[s] = np.linspace(100, 130, n)
+    return pd.DataFrame(data, index=idx)
+
+
+def _gold_strat():
+    from trading_bot.strategies.composer import (ComposedConfig,
+                                                 ComposedStrategy, SignalSpec)
+    cfg = ComposedConfig(
+        name="g", rationale="x" * 30,
+        signals=(SignalSpec(feature="momentum", params={"lookback": 60, "skip": 5}),),
+        filters=(), regime=None, top_n=3, gold_weight=0.3, gold_mode="defensive")
+    return ComposedStrategy(cfg)
+
+
+def test_gold_scale_zero_at_highs():
+    spy = np.linspace(100, 300, 400)        # no drawdown — SPY ai massimi
+    p = _gold_panel(spy)
+    assert _gold_strat()._gold_scale(p, p.index[-1]) < 0.1
+
+
+def test_gold_scale_full_in_deep_drawdown():
+    spy = np.concatenate([np.linspace(100, 300, 300), np.linspace(300, 225, 100)])
+    p = _gold_panel(spy)                     # -25% from peak
+    assert _gold_strat()._gold_scale(p, p.index[-1]) > 0.9
+
+
+def test_gold_scale_monotonic_in_drawdown():
+    s = _gold_strat()
+    shallow = _gold_panel(np.concatenate([np.linspace(100, 300, 300),
+                                          np.linspace(300, 285, 100)]))   # -5%
+    mid = _gold_panel(np.concatenate([np.linspace(100, 300, 300),
+                                      np.linspace(300, 270, 100)]))       # -10%
+    deep = _gold_panel(np.concatenate([np.linspace(100, 300, 300),
+                                       np.linspace(300, 225, 100)]))      # -25%
+    a = s._gold_scale(shallow, shallow.index[-1])
+    b = s._gold_scale(mid, mid.index[-1])
+    c = s._gold_scale(deep, deep.index[-1])
+    assert a <= b <= c
+
+
+def test_gold_scale_zero_when_gold_downtrend():
+    spy = np.concatenate([np.linspace(100, 300, 300), np.linspace(300, 225, 100)])
+    p = _gold_panel(spy, gld_rising=False)   # crisi ma oro in downtrend
+    assert _gold_strat()._gold_scale(p, p.index[-1]) == 0.0
