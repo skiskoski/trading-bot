@@ -33,6 +33,10 @@ from trading_bot.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+class NoDeployableStrategyError(RuntimeError):
+    """Raised when no strategy has passed the current live/paper gate."""
+
+
 @dataclass
 class SignalOutput:
     strategy_name: str
@@ -48,6 +52,8 @@ def _load_strategy(name: str | None) -> tuple[str, ComposedConfig | TSMOMConfig]
 
     If name is None, picks the best promoted strategy by OOS Sharpe.
     Promoted status is read from research_log (source of truth), not registry.
+    The loader is intentionally fail-closed: it must not fall back to arbitrary
+    registry strategies when there are no current promotions.
     """
     from trading_bot.data.storage import ResearchLog, get_session
     from sqlalchemy import select
@@ -69,27 +75,20 @@ def _load_strategy(name: str | None) -> tuple[str, ComposedConfig | TSMOMConfig]
         ).scalars().all()
 
     if name:
-        # Look up by name in registry
+        row = next((r for r in promoted_rows if r.hypothesis_name == name), None)
+        if row is None:
+            raise NoDeployableStrategyError(
+                f"Strategy '{name}' is not deployable: it has not passed the current promotion gate."
+            )
         match = strat_by_name.get(name)
-        if not match:
-            # Try research_log: find by hypothesis_name
-            row = next((r for r in promoted_rows if r.hypothesis_name == name), None)
-            if row is None:
-                # Fallback: search all strategies (not just promoted)
-                match = next((s for s in strategies if s["name"] == name), None)
-                if not match:
-                    raise ValueError(f"Strategy '{name}' not found in registry.")
-            else:
-                match = {"name": row.hypothesis_name, "config_json": row.config_json}
-        chosen = match
+        chosen = match if match else {"name": row.hypothesis_name, "config_json": row.config_json}
     else:
         # Auto-select best promoted
         if not promoted_rows:
-            # Fall back to any strategy in registry
-            if not strategies:
-                raise RuntimeError("No strategies in registry. Run `tradebot research` first.")
-            strategies_sorted = sorted(strategies, key=lambda s: 0, reverse=True)
-            chosen = strategies_sorted[0]
+            raise NoDeployableStrategyError(
+                "No deployable strategy found. Signals are disabled until a strategy passes "
+                "the current validation/promotion gate."
+            )
         else:
             best_row = promoted_rows[0]  # already sorted by oos_sharpe desc
             match = strat_by_name.get(best_row.hypothesis_name)

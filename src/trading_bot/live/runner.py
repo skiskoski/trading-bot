@@ -33,7 +33,7 @@ from rich.panel import Panel
 from trading_bot.data.ingest import ingest_symbols, incremental_update
 from trading_bot.live.alpaca import AlpacaClient, get_alpaca_client
 from trading_bot.live.notifier import NotifyLevel, TelegramNotifier, get_notifier, notify
-from trading_bot.live.signals import SignalOutput, generate_signals
+from trading_bot.live.signals import NoDeployableStrategyError, SignalOutput, generate_signals
 from trading_bot.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -239,6 +239,11 @@ def run_daily(
                 regime_active=signals.regime_active,
             )
 
+    except NoDeployableStrategyError as e:
+        msg = f"Signals disabled: {e}"
+        logger.warning(msg)
+        result.errors.append(msg)
+        console.print(f"  [yellow]⚠ {msg}[/yellow]")
     except Exception as e:
         msg = f"Signal generation failed: {e}"
         logger.error(msg)

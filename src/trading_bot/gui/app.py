@@ -21,6 +21,7 @@ pages = [
     st.Page("views/strategie.py", title="Strategie", icon="📈"),
     st.Page("views/portafoglio.py", title="Portafoglio", icon="🎯"),
     st.Page("views/validazione.py", title="Validazione", icon="✅"),
+    st.Page("views/meteo.py", title="Meteo Mercato", icon="🌩"),
     st.Page("views/live.py", title="Live", icon="💼"),
     st.Page("views/storico.py", title="Storico", icon="📅"),
     st.Page("views/guida.py", title="Guida", icon="ℹ️"),

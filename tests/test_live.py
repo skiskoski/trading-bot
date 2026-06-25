@@ -99,6 +99,26 @@ class TestRunner:
         from trading_bot.live.runner import DailyRunResult
         assert isinstance(result, DailyRunResult)
 
+    def test_daily_run_no_deployable_strategy_does_not_notify_telegram(self):
+        """Expected no-strategy state should not send Telegram signal/error spam."""
+        from trading_bot.live.runner import DailyRunResult, run_daily
+        from trading_bot.live.signals import NoDeployableStrategyError
+
+        notifier = MagicMock()
+        with patch("trading_bot.live.runner.get_notifier", return_value=notifier), \
+             patch("trading_bot.live.runner.get_alpaca_client", return_value=None), \
+             patch("trading_bot.live.runner.generate_signals",
+                   side_effect=NoDeployableStrategyError("No deployable strategy found.")), \
+             patch("trading_bot.live.runner.is_rebalance_day", return_value=False), \
+             patch("trading_bot.live.runner.is_volatility_rebalance_day", return_value=False):
+            result = run_daily(dry_run=True, skip_ingest=True, universe_size=50)
+
+        assert isinstance(result, DailyRunResult)
+        assert result.signals is None
+        assert result.errors == ["Signals disabled: No deployable strategy found."]
+        notifier.notify_signals.assert_not_called()
+        notifier.notify_error.assert_not_called()
+
 
 # ── Signals ───────────────────────────────────────────────────────────────────
 
@@ -111,6 +131,44 @@ class TestSignals:
              patch("trading_bot.live.signals.list_runs", return_value=[]):
             with pytest.raises(RuntimeError, match="No strategies"):
                 generate_signals()
+
+    def test_load_strategy_does_not_fallback_to_registry_without_promotion(self):
+        """Registry entries are not deployable unless the current gate promoted them."""
+        from trading_bot.live.signals import NoDeployableStrategyError, _load_strategy
+
+        class FakeResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, _stmt):
+                return FakeResult()
+
+        registry_strategy = {
+            "name": "r05_mac+vol_t20_200",
+            "config": {
+                "rationale": "old tested strategy that must not be deployed",
+                "signals": [],
+                "filters": [],
+                "regime": None,
+                "top_n": 10,
+            },
+        }
+
+        with patch("trading_bot.live.signals.list_strategies", return_value=[registry_strategy]), \
+             patch("trading_bot.live.signals.list_runs", return_value=[{"id": 1}]), \
+             patch("trading_bot.data.storage.get_session", return_value=FakeSession()):
+            with pytest.raises(NoDeployableStrategyError, match="No deployable strategy"):
+                _load_strategy(None)
 
     def test_signal_output_weights_normalized(self):
         """Positions should never sum to > 1.0."""

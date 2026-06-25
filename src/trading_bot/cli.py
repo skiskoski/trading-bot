@@ -649,6 +649,390 @@ def validate_cpcv_cmd(
                   run_cpcv=True, cpcv_k=k)
 
 
+def _load_catalog_validation_context(
+    name: str,
+    start: str,
+    end: str | None,
+    top: int,
+    use_pit: bool,
+    capital_base: float | None = None,
+    fixed_cost: float = 0.0,
+):
+    from trading_bot.backtest.engine import BacktestConfig, CrossSectionalBacktester
+    from trading_bot.data.ingest import load_panel
+    from trading_bot.data.pit_universe import build_membership_panel
+    from trading_bot.data.storage import Ticker, get_session
+    from trading_bot.data.universe import get_top_n_by_liquidity
+    from trading_bot.strategies.catalog import CATALOG
+    from trading_bot.strategies.composer import ComposedConfig, ComposedStrategy
+
+    if name not in CATALOG:
+        console.print(f"[red]Unknown strategy: {name}[/red]")
+        raise typer.Exit(code=1)
+    cfg = CATALOG[name]
+    if not isinstance(cfg, ComposedConfig) or not cfg.signals:
+        console.print(
+            f"[red]'{name}' is not a parameter-grid compatible composed strategy yet.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    symbols = get_top_n_by_liquidity(top)
+    for service in ("SPY", "GLD", "HYG"):
+        if service not in symbols:
+            symbols = [service, *symbols]
+    panel = load_panel(symbols, start=start, end=end).dropna(how="all", axis=1)
+    if panel.empty:
+        console.print("[red]No data — run fetch-universe + ingest-all first[/red]")
+        raise typer.Exit(code=1)
+
+    membership = None
+    if use_pit:
+        with get_session() as session:
+            current = {s[0] for s in session.query(Ticker.symbol).all()}
+        membership = build_membership_panel(panel.index, current, symbols=list(panel.columns))
+
+    bt_cfg = BacktestConfig(
+        membership=membership,
+        capital_base=capital_base,
+        fixed_cost_per_trade=fixed_cost,
+    )
+    strat = ComposedStrategy(cfg)
+    result = CrossSectionalBacktester(strat, bt_cfg).run(panel)
+    return cfg, strat, panel, bt_cfg, result
+
+
+def _load_storm_context(
+    start: str,
+    end: str | None,
+    top: int,
+):
+    from sqlalchemy import select
+
+    from trading_bot.data.ingest import load_panel
+    from trading_bot.data.storage import Ticker, get_session
+    from trading_bot.data.universe import get_top_n_by_liquidity
+
+    symbols = get_top_n_by_liquidity(top)
+    for service in ("SPY", "HYG", "GLD"):
+        if service not in symbols:
+            symbols = [service, *symbols]
+    panel = load_panel(symbols, start=start, end=end).dropna(how="all", axis=1)
+    if panel.empty:
+        console.print("[red]No data — run fetch-universe + ingest-all first[/red]")
+        raise typer.Exit(code=1)
+
+    with get_session() as session:
+        rows = session.execute(select(Ticker.symbol, Ticker.sector)).all()
+    sector_map = {sym: sector for sym, sector in rows if sector}
+    return panel, sector_map
+
+
+@app.command("market-storm")
+def market_storm_cmd(
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(300, help="Top-N universe for breadth/correlation"),
+) -> None:
+    """Show current Market Storm regime and component scores."""
+    from trading_bot.risk.market_storm import compute_storm_history, current_storm_point
+
+    panel, sector_map = _load_storm_context(start, end, top)
+    history = compute_storm_history(panel, sector_map=sector_map)
+    point = current_storm_point(history)
+    _print_storm_point(point)
+
+
+@app.command("market-storm-history")
+def market_storm_history_cmd(
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(300, help="Top-N universe for breadth/correlation"),
+    output: str | None = typer.Option(None, help="Optional CSV output path"),
+) -> None:
+    """Compute Market Storm history and optionally save it to CSV."""
+    from trading_bot.risk.market_storm import compute_storm_history
+
+    panel, sector_map = _load_storm_context(start, end, top)
+    history = compute_storm_history(panel, sector_map=sector_map)
+    _print_storm_history_tail(history)
+    if output:
+        out = Path(output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        history.to_csv(out)
+        console.print(f"[green]✓[/green] Saved storm history: {out}")
+
+
+@app.command("validate-storm-overlay")
+def validate_storm_overlay_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(300),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+) -> None:
+    """Compare a strategy with and without the Market Storm exposure overlay."""
+    from trading_bot.risk.market_storm import compare_overlay, compute_storm_history
+
+    _cfg, _strat, panel, _bt_cfg, result = _load_catalog_validation_context(
+        name, start, end, top, use_pit, capital_base=10_000.0, fixed_cost=0.35
+    )
+    sector_map = _load_storm_context(start, end, top)[1]
+    history = compute_storm_history(panel, sector_map=sector_map)
+    comparison = compare_overlay(result.returns, panel["SPY"].pct_change().fillna(0.0), history)
+    _print_overlay_comparison(comparison)
+
+
+@app.command("storm-report")
+def storm_report_cmd(
+    name: str = typer.Argument("market", help="Strategy name from catalog, or 'market'"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(300),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    output_dir: str = typer.Option("data/market_storm_reports", help="Report directory"),
+) -> None:
+    """Generate a Market Storm JSON report, optionally with strategy overlay comparison."""
+    from trading_bot.risk.market_storm import build_storm_report, save_storm_report
+
+    if name == "market":
+        panel, sector_map = _load_storm_context(start, end, top)
+        report, _history = build_storm_report("market", panel, sector_map=sector_map)
+    else:
+        _cfg, _strat, panel, _bt_cfg, result = _load_catalog_validation_context(
+            name, start, end, top, use_pit, capital_base=10_000.0, fixed_cost=0.35
+        )
+        sector_map = _load_storm_context(start, end, top)[1]
+        report, _history = build_storm_report(
+            name, panel, strategy_returns=result.returns, sector_map=sector_map
+        )
+    _print_storm_report(report)
+    path = save_storm_report(report, output_dir)
+    console.print(f"[green]✓[/green] Saved Market Storm report: {path}")
+
+
+@app.command("parameter-stability")
+def parameter_stability_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(500),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    grid: str = typer.Option("auto", help="Parameter grid: auto | momentum_core"),
+    metric: str = typer.Option("Sharpe", help="Metric: Sharpe | IC_mean | IC_IR | CAGR"),
+    mc_trials_per_set: int = typer.Option(0, help="Monte Carlo trials for each parameter set"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save JSON report"),
+) -> None:
+    """Run local parameter stability and plateau detection for a catalog strategy."""
+    from trading_bot.validation.robustness import (
+        RobustnessConfig,
+        RobustnessReport,
+        run_parameter_stability,
+        save_report,
+    )
+
+    cfg, _strat, panel, bt_cfg, _result = _load_catalog_validation_context(
+        name, start, end, top, use_pit
+    )
+    rb_cfg = RobustnessConfig(parameter_mc_trials=mc_trials_per_set)
+    ps = run_parameter_stability(
+        cfg, panel, bt_cfg, grid_name=grid, metric=metric, gate=rb_cfg.gate, mc_config=rb_cfg
+    )
+    _print_parameter_stability(ps)
+    if save:
+        report = RobustnessReport(
+            strategy_name=cfg.name,
+            generated_at=np.datetime64("now").astype(str),
+            parameter_stability=ps,
+            monte_carlo=None,
+            walk_forward=None,
+            hard_gates={"parameter_stability": ps.passed},
+            decision="promote_to_next_validation" if ps.passed else "reject_or_research_more",
+            notes=[] if ps.passed else ["Parameter plateau is too narrow."],
+        )
+        path = save_report(report, RobustnessConfig().output_dir)
+        console.print(f"[green]✓[/green] Saved {path}")
+
+
+@app.command("monte-carlo")
+def monte_carlo_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(500),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    trials: int = typer.Option(1000, help="Monte Carlo trials"),
+    block_length: int | None = typer.Option(None, help="Moving block length (default T^(1/3))"),
+    seed: int = typer.Option(42, help="Random seed"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save JSON report"),
+) -> None:
+    """Run moving-block Monte Carlo on the strategy's backtest returns."""
+    from trading_bot.validation.robustness import (
+        RobustnessConfig,
+        RobustnessReport,
+        run_monte_carlo,
+        save_report,
+    )
+
+    cfg, _strat, _panel, _bt_cfg, result = _load_catalog_validation_context(
+        name, start, end, top, use_pit
+    )
+    rb_cfg = RobustnessConfig(mc_trials=trials, mc_block_length=block_length, mc_seed=seed)
+    mc = run_monte_carlo(result.returns, rb_cfg)
+    _print_monte_carlo(mc)
+    if save:
+        report = RobustnessReport(
+            strategy_name=cfg.name,
+            generated_at=np.datetime64("now").astype(str),
+            parameter_stability=None,
+            monte_carlo=mc,
+            walk_forward=None,
+            hard_gates={"monte_carlo": mc.passed},
+            decision="promote_to_next_validation" if mc.passed else "reject_or_research_more",
+            notes=[] if mc.passed else ["Monte Carlo dispersion is too weak."],
+        )
+        path = save_report(report, rb_cfg.output_dir)
+        console.print(f"[green]✓[/green] Saved {path}")
+
+
+@app.command("walk-forward")
+def walk_forward_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(500),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    folds: int = typer.Option(8, help="Walk-forward folds"),
+    test_years: float = typer.Option(1.0, help="Years per test fold"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save JSON report"),
+) -> None:
+    """Run rolling and anchored walk-forward robustness checks."""
+    from trading_bot.validation.robustness import (
+        RobustnessConfig,
+        RobustnessReport,
+        run_walk_forward_robustness,
+        save_report,
+    )
+
+    cfg, strat, panel, bt_cfg, _result = _load_catalog_validation_context(
+        name, start, end, top, use_pit
+    )
+    rb_cfg = RobustnessConfig(wf_folds=folds, wf_test_years=test_years)
+    wf = run_walk_forward_robustness(strat, panel, bt_cfg, rb_cfg)
+    _print_walk_forward_robustness(wf)
+    if save:
+        report = RobustnessReport(
+            strategy_name=cfg.name,
+            generated_at=np.datetime64("now").astype(str),
+            parameter_stability=None,
+            monte_carlo=None,
+            walk_forward=wf,
+            hard_gates={"walk_forward": wf.passed},
+            decision="promote_to_next_validation" if wf.passed else "reject_or_research_more",
+            notes=[] if wf.passed else ["Walk-forward fold stability is too weak."],
+        )
+        path = save_report(report, rb_cfg.output_dir)
+        console.print(f"[green]✓[/green] Saved {path}")
+
+
+@app.command("robustness-report")
+def robustness_report_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(500),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    grid: str = typer.Option("auto", help="Parameter grid: auto | momentum_core"),
+    mc_trials: int = typer.Option(1000, help="Monte Carlo trials"),
+    param_mc_trials: int = typer.Option(100, help="Monte Carlo trials for each parameter set"),
+    mc_seed: int = typer.Option(42, help="Monte Carlo seed"),
+    wf_folds: int = typer.Option(8, help="Walk-forward folds"),
+    output_dir: str = typer.Option("data/validation_reports", help="Report directory"),
+) -> None:
+    """Build and save the full robustness report: parameter grid + MC + walk-forward."""
+    from trading_bot.validation.robustness import (
+        RobustnessConfig,
+        build_robustness_report,
+        save_report,
+    )
+
+    cfg, _strat, panel, bt_cfg, result = _load_catalog_validation_context(
+        name, start, end, top, use_pit
+    )
+    rb_cfg = RobustnessConfig(
+        output_dir=output_dir,
+        mc_trials=mc_trials,
+        parameter_mc_trials=param_mc_trials,
+        mc_seed=mc_seed,
+        wf_folds=wf_folds,
+    )
+    report = build_robustness_report(
+        cfg, panel, bt_cfg, result.returns, rb_cfg, grid_name=grid
+    )
+    _print_robustness_report(report)
+    path = save_report(report, output_dir)
+    console.print(f"[green]✓[/green] Saved full robustness report: {path}")
+
+
+@app.command("validate-strategy")
+def validate_strategy_cmd(
+    name: str = typer.Argument(..., help="Strategy name from catalog"),
+    start: str = typer.Option("2005-01-01"),
+    end: str | None = typer.Option(None),
+    top: int = typer.Option(500),
+    use_pit: bool = typer.Option(True, "--pit/--no-pit"),
+    cpcv_k: int = typer.Option(10, help="CPCV folds"),
+    mc_trials: int = typer.Option(1000, help="Monte Carlo trials"),
+    param_mc_trials: int = typer.Option(100, help="Monte Carlo trials for each parameter set"),
+    wf_folds: int = typer.Option(8, help="Walk-forward folds"),
+    output_dir: str = typer.Option("data/validation_reports", help="Report directory"),
+) -> None:
+    """Run the pre-paper validation pipeline for one catalog strategy."""
+    from trading_bot.validation.cpcv import CPCVConfig, run_cpcv
+    from trading_bot.validation.robustness import (
+        RobustnessConfig,
+        build_robustness_report,
+        save_report,
+    )
+
+    cfg, strat, panel, bt_cfg, result = _load_catalog_validation_context(
+        name, start, end, top, use_pit, capital_base=10_000.0, fixed_cost=0.35
+    )
+    console.print("\n[bold cyan]Base backtest netto costi[/bold cyan]")
+    _print_metrics(result.metrics)
+    console.print(f"\n[cyan]Running CPCV k={cpcv_k} ({cpcv_k*(cpcv_k-1)//2} paths)…[/cyan]")
+    cpcv = run_cpcv(strat, panel, bt_cfg, CPCVConfig(k=cpcv_k, n_test=2, purge_days=21))
+    _print_cpcv(cpcv)
+
+    rb_cfg = RobustnessConfig(
+        output_dir=output_dir,
+        mc_trials=mc_trials,
+        parameter_mc_trials=param_mc_trials,
+        wf_folds=wf_folds,
+    )
+    report = build_robustness_report(
+        cfg, panel, bt_cfg, result.returns, rb_cfg, grid_name="auto"
+    )
+    full_gates = {
+        **report.hard_gates,
+        "cpcv_pbo": cpcv.pbo < 0.4,
+        "cpcv_fraction_positive": cpcv.fraction_positive >= 0.65,
+        "oos_sharpe": cpcv.mean_oos_sharpe >= 0.5,
+    }
+    report = report.__class__(
+        strategy_name=report.strategy_name,
+        generated_at=report.generated_at,
+        parameter_stability=report.parameter_stability,
+        monte_carlo=report.monte_carlo,
+        walk_forward=report.walk_forward,
+        hard_gates=full_gates,
+        decision="promote_to_paper_review" if all(full_gates.values()) else "reject_or_research_more",
+        notes=report.notes + ["CPCV included in validate-strategy gate."],
+    )
+    _print_robustness_report(report)
+    path = save_report(report, output_dir)
+    console.print(f"[green]✓[/green] Saved validation report: {path}")
+
+
 @app.command("run-portfolio")
 def run_portfolio_cmd(
     start: str = typer.Option("2005-01-01"),
@@ -973,6 +1357,201 @@ def _print_walk_forward(wf) -> None:
         f"min {s['sharpe_min']:.3f}, max {s['sharpe_max']:.3f}); "
         f"IC mean={s['ic_mean']:.4f}; profitable folds={s['fraction_profitable'] * 100:.0f}%"
     )
+
+
+def _print_parameter_stability(ps) -> None:
+    from rich.panel import Panel
+
+    color = "green" if ps.passed else "red"
+    console.print(Panel(
+        f"[bold]Parameter Stability[/bold]\n\n"
+        f"Best {ps.metric}: {ps.best_metric:.3f}\n"
+        f"Median {ps.metric}: {ps.median_metric:.3f}\n"
+        f"Plateau threshold: {ps.plateau_threshold:.3f}\n"
+        f"Plateau fraction: {ps.plateau_fraction:.0%}\n"
+        f"Best-neighbor gap: {ps.best_neighbor_gap:.3f}\n"
+        f"Decision: {'PASS' if ps.passed else 'FAIL'}",
+        title=ps.strategy_name,
+        border_style=color,
+    ))
+    table = Table(title="Parameter grid", show_header=True)
+    table.add_column("Params", style="cyan")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("IC", justify="right")
+    table.add_column("MaxDD", justify="right")
+    has_mc = any(r.mc_sharpe_p05 is not None for r in ps.runs)
+    if has_mc:
+        table.add_column("MC Sharpe p05", justify="right")
+        table.add_column("MC loss", justify="right")
+    rows = sorted(ps.runs, key=lambda r: r.sharpe, reverse=True)
+    for r in rows[:20]:
+        cells = [
+            ", ".join(f"{k}={v}" for k, v in r.params.items()),
+            f"{r.sharpe:.3f}",
+            f"{r.ic_mean:.4f}",
+            f"{r.max_drawdown:.2%}",
+        ]
+        if has_mc:
+            cells.extend([
+                f"{r.mc_sharpe_p05:.3f}" if r.mc_sharpe_p05 is not None else "n/a",
+                f"{r.mc_loss_probability:.1%}" if r.mc_loss_probability is not None else "n/a",
+            ])
+        table.add_row(*cells)
+    console.print(table)
+
+
+def _print_monte_carlo(mc) -> None:
+    from rich.panel import Panel
+
+    color = "green" if mc.passed else "red"
+    console.print(Panel(
+        f"[bold]Moving-block Monte Carlo[/bold]\n\n"
+        f"Trials: {mc.trials:,}  block={mc.block_length}  seed={mc.seed}\n"
+        f"Sharpe p05/p50/p95: {mc.sharpe_p05:.3f} / {mc.sharpe_p50:.3f} / {mc.sharpe_p95:.3f}\n"
+        f"MaxDD p50/p95: {mc.max_drawdown_p50:.2%} / {mc.max_drawdown_p95:.2%}\n"
+        f"Terminal return p05/p50/p95: "
+        f"{mc.terminal_return_p05:.2%} / {mc.terminal_return_p50:.2%} / {mc.terminal_return_p95:.2%}\n"
+        f"Loss probability: {mc.loss_probability:.1%}\n"
+        f"Decision: {'PASS' if mc.passed else 'FAIL'}",
+        title="Monte Carlo",
+        border_style=color,
+    ))
+
+
+def _print_walk_forward_robustness(wf) -> None:
+    from rich.panel import Panel
+
+    color = "green" if wf.passed else "red"
+    console.print(Panel(
+        f"[bold]Walk-forward robustness[/bold]\n\n"
+        f"Worst fold Sharpe: {wf.worst_sharpe:.3f}\n"
+        f"Profitable folds: {wf.fraction_profitable:.0%}\n"
+        f"Rolling mean Sharpe: {wf.rolling_summary.get('sharpe_mean', 0):.3f}\n"
+        f"Anchored mean Sharpe: {wf.anchored_summary.get('sharpe_mean', 0):.3f}\n"
+        f"Decision: {'PASS' if wf.passed else 'FAIL'}",
+        title="Walk-forward",
+        border_style=color,
+    ))
+
+
+def _print_robustness_report(report) -> None:
+    from rich.panel import Panel
+
+    color = "green" if report.decision.startswith("promote") else "red"
+    gates = "\n".join(
+        f"  {'PASS' if ok else 'FAIL'} {name}" for name, ok in report.hard_gates.items()
+    )
+    console.print(Panel(
+        f"[bold]Decision[/bold]: {report.decision}\n\n"
+        f"[bold]Hard gates[/bold]\n{gates}",
+        title=f"Robustness report — {report.strategy_name}",
+        border_style=color,
+    ))
+    if report.parameter_stability is not None:
+        _print_parameter_stability(report.parameter_stability)
+    if report.monte_carlo is not None:
+        _print_monte_carlo(report.monte_carlo)
+    if report.walk_forward is not None:
+        _print_walk_forward_robustness(report.walk_forward)
+
+
+def _print_storm_point(point) -> None:
+    from rich.panel import Panel
+
+    color = {
+        "calm": "green",
+        "unstable": "yellow",
+        "storm": "red",
+        "panic": "bold red",
+    }.get(point.regime, "yellow")
+    console.print(Panel(
+        f"[bold]Score[/bold]: {point.storm_score:.1f}/100\n"
+        f"[bold]Regime[/bold]: {point.regime}\n"
+        f"[bold]Action[/bold]: {point.recommended_action}\n"
+        f"[bold]Exposure[/bold]: {point.exposure_scale:.0%}\n"
+        f"[bold]Rationale[/bold]: {point.rationale}",
+        title=f"Market Storm — {point.dt}",
+        border_style=color,
+    ))
+    table = Table(title="Storm components", show_header=True)
+    table.add_column("Component", style="cyan")
+    table.add_column("Score", justify="right")
+    for key, value in sorted(point.components.items(), key=lambda kv: kv[1], reverse=True):
+        table.add_row(key, f"{value:.1f}")
+    console.print(table)
+
+
+def _print_storm_history_tail(history) -> None:
+    table = Table(title="Market Storm history (last 12 rows)", show_header=True)
+    table.add_column("Date")
+    table.add_column("Score", justify="right")
+    table.add_column("Regime")
+    table.add_column("Action")
+    table.add_column("Exposure", justify="right")
+    for dt, row in history.tail(12).iterrows():
+        table.add_row(
+            dt.date().isoformat() if hasattr(dt, "date") else str(dt),
+            f"{row['storm_score']:.1f}",
+            str(row["regime"]),
+            str(row["recommended_action"]),
+            f"{row['exposure_scale']:.0%}",
+        )
+    console.print(table)
+
+
+def _print_overlay_comparison(comparison) -> None:
+    from rich.panel import Panel
+
+    color = "green" if comparison.passed else "red"
+    gates = "\n".join(
+        f"  {'PASS' if ok else 'FAIL'} {name}"
+        for name, ok in comparison.gates.items()
+    )
+    console.print(Panel(
+        f"[bold]Decision[/bold]: {'PASS' if comparison.passed else 'FAIL'}\n\n"
+        f"[bold]Gates[/bold]\n{gates}",
+        title="Market Storm overlay validation",
+        border_style=color,
+    ))
+    table = Table(title="Base vs Storm overlay", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Base", justify="right")
+    table.add_column("Overlay", justify="right")
+    table.add_column("Delta", justify="right")
+    for key, base_value in comparison.base_metrics.items():
+        overlay_value = comparison.overlay_metrics.get(key, 0.0)
+        delta = comparison.deltas.get(key, 0.0)
+        if key in {"CAGR", "MaxDrawdown", "WorstMonth", "Volatility", "HitRate"}:
+            table.add_row(key, f"{base_value:.2%}", f"{overlay_value:.2%}", f"{delta:+.2%}")
+        else:
+            table.add_row(key, f"{base_value:.3f}", f"{overlay_value:.3f}", f"{delta:+.3f}")
+    console.print(table)
+
+    if comparison.worst_months:
+        worst = Table(title="Worst SPY months", show_header=True)
+        worst.add_column("Month")
+        worst.add_column("SPY", justify="right")
+        worst.add_column("Base", justify="right")
+        worst.add_column("Overlay", justify="right")
+        worst.add_column("Helped")
+        for row in comparison.worst_months[:10]:
+            worst.add_row(
+                row["month"],
+                f"{row['benchmark']:.2%}",
+                f"{row['base']:.2%}",
+                f"{row['overlay']:.2%}",
+                "yes" if row["overlay_helped"] else "no",
+            )
+        console.print(worst)
+
+
+def _print_storm_report(report) -> None:
+    _print_storm_point(report.current)
+    if report.overlay is not None:
+        _print_overlay_comparison(report.overlay)
+    console.print(f"[bold]Decision[/bold]: {report.decision}")
+    for note in report.notes:
+        console.print(f"[dim]- {note}[/dim]")
 
 
 @app.command("backtest")
