@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "workspace": {
+    "name": "trading-bot",
+    "createdAt": 1781092907504,
+    "preset": "starter"
+  },
+  "authorizedRoots": [
+    "/Users/simone/trading-bot"
+  ],
+  "reload": null
+}
